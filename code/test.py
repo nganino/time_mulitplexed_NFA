@@ -308,8 +308,7 @@ def _save_slm_masks(model, config, out_dir, dpi=200):
     # compute columns per row; handle edge cases where T != M*C
     cols = int(np.ceil(T / C))
     rows = C
-    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
-    axes = np.atleast_2d(axes)
+    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows), squeeze=False)
     m_idx = 0
     for r in range(rows):
         for c in range(cols):

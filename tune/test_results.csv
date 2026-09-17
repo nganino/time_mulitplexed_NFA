@@ -1,0 +1,3 @@
+sweep,label,ckpt,n_samples,accuracy,loss_mean,loss_std,macro_f1
+maj_voting_C_sweep,C=1,P:\Nicholas\time_multiplexed_NFA\code\logs\maj_voting_C_sweep\20260916-1819-M1-C1-K3-Spacings30mm-30mm-5.0mm-30mm-batchsize12-lrslm1e-02-lrlayer1e-02-samples20000-vote\model\best.pth,10000,0.4635,1.5979,0.7031,0.4626
+maj_voting_C_sweep,C=2,P:\Nicholas\time_multiplexed_NFA\code\logs\maj_voting_C_sweep\20260917-0049-M1-C2-K3-Spacings30mm-30mm-5.0mm-30mm-batchsize12-lrslm1e-02-lrlayer1e-02-samples20000-vote\model\best.pth,10000,0.4583,1.603,0.7054,0.4605

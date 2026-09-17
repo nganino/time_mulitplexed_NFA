@@ -11,10 +11,6 @@ I_vec : [B, T, pd_num_rows, pd_num_cols] instead of a decoded image; splitting T
 into countries/members and turning that into the 10-way differential class scores
 (rows 0..pd_num_rows/2-1 positive, pd_num_rows/2..end negative, paired by column)
 is done downstream in loss.py.
-
-NOTE: self.decoder_type / self.output_phase_max below are vestigial from the old
-image-reconstruction decoder path and are intentionally left alone here — the owner
-of loss.py is removing that path separately.
 '''
 
 import sys, os

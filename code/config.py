@@ -1,5 +1,5 @@
 '''
-Time-Multiplexed Classifier — config parameters 
+Time-Multiplexed NFA — config parameters 
 
 Data paths point to the parent project directory so the same datasets are shared.
 Logs are written to conv_decoder/logs/ to keep runs separate.
@@ -23,16 +23,11 @@ def _build_run_name(tc):
     return (f'{datetime_str}'
             f'-M{tc.M}-C{tc.C}-K{tc.num_layers}'
             f'-Spacings{1000*tc.object_slm_spacing:.0f}mm-{1000*tc.slm_first_layer_spacing:.0f}mm-{1000*tc.interlayer_spacing:.1f}mm-{1000*tc.last_layer_ccd_spacing:.0f}mm'
-            f'-batchsize{tc.batch_size}-lrslm{tc.lr_slm:.0e}-lrlayer{tc.lr_layer:.0e}'
+            f'-batchsize{tc.batch_size}-lrslm{tc.lr_slm:.0e}-lrlayer{tc.lr_layer:.0e}-pdsize{1000*tc.photodiode_size:.1f}mm'
             f'-{samples_str}-{loss}')
 
 
 def config_to_dict(tc):
-    '''JSON/checkpoint-safe snapshot of every scalar config value: ints, floats, strs,
-    bools, None, and anything with .item() (numpy/torch scalars, unwrapped to a plain
-    Python value). Skips everything else (there isn't much -- config is otherwise flat).
-    Shared by train.py's checkpoint saving and its per-run config.json dump, so both
-    stay in sync automatically.'''
     return {k: (v.item() if hasattr(v, 'item') else v)
             for k, v in vars(tc).items()
             if not k.startswith('_') and (isinstance(v, (int, float, str, bool, type(None)))
@@ -41,7 +36,6 @@ def config_to_dict(tc):
 
 def _build_log_paths(tc):
     '''Single source of truth for where a run's output goes, derived from tc.run_name.
-
     '''
     tc.log_dir     = os.path.join(_paths.LOG_DIR, 'maj_voting_C_sweep', tc.run_name)
     tc.image_dir   = os.path.join(tc.log_dir, 'images')
@@ -157,8 +151,8 @@ def init_params():
     tc.pd_num_cols = 5
     tc.num_photodiodes = tc.pd_num_rows * tc.pd_num_cols
 
-    tc.pd_row_spacing = .2 * mm               # center-to-center spacing, row direction
-    tc.pd_col_spacing = .2 * mm               # center-to-center spacing, column direction
+    tc.pd_row_spacing = 2 * tc.photodiode_size  # center-to-center spacing, row direction
+    tc.pd_col_spacing = 2 * tc.photodiode_size  # center-to-center spacing, column direction
     tc.pd_row_spacing_px = int(tc.pd_row_spacing / tc.sim_dx)
     tc.pd_col_spacing_px = int(tc.pd_col_spacing / tc.sim_dx)
 
