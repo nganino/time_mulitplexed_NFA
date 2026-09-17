@@ -1,224 +1,323 @@
-# time-multiplexed-classifier
+# time-multiplexed-NFA
 
-A phase object is encoded optically by a bank of **M = 20 learned SLM phase
-masks applied in time-multiplexed sequence**. Each object + phase mask pair propagates
-through successive diffractive phase layers before reaching a differential detector array plane.
-Each detector sums the signal acquired across the M phase masks, predicting the object class 
-through the max differential signal of a pair of photodiodes corresponding to the object's class.
-```
-                   SLM phase bias (M=20 learned masks, time-multiplexed)
-                                    |
-                              phase object
-                                    |
-                    free-space propagation -- K learned diffractive phase
-                                    layers in series
-                                    |
-                                    v
-                    20 Photodiode Regions to Perform Differential Detection on 10 Classes
-                                    |
-                                    v
-            Detected Class = max{I+_1 - I-_1 / (I+_1 + I-_1), .. ,{I+_10 - I-_10 / (I+_10 + I-_10)}
-```
+**NFA = Nonlinear Function Approximation.** This repo optically approximates `Nf`
+independent, arbitrary nonlinear functions `f_k(a)`, k = 1..Nf, of a single scalar
+input `a`, all in parallel, using a diffractive optical processor -- following
+Rahman et al., *"Massively parallel and universal approximation of nonlinear
+functions using diffractive processors,"* eLight (2025) 5:32 (DOI
+10.1186/s43593-025-00113-w) -- **plus one addition of our own**: a learned,
+time-multiplexed **phase-key plane** placed before the input encoding. The idea is
+"wisdom of the crowd": each of `M` phase keys gives one independent (imperfect)
+optical estimate of `f(a)`; averaging the `M` raw detector intensities before
+normalizing is meant to reduce approximation error for a *fixed* set of `Nf`
+functions. This is a different goal from the paper's own time-multiplexing (which
+uses multiple wavelengths to *increase the number* of functions computed in
+parallel, not to improve accuracy on a fixed set).
 
-## Optical and training parameters (`code/config.py`)
+This project was pivoted (Sep 2026, in a single working session) from an earlier,
+structurally similar codebase that did time-multiplexed **image classification**
+(MNIST/CIFAR phase objects -> differential photodiode-pair contrast -> softmax
+cross-entropy). That pivot is essentially complete as of this README (config,
+model, loss, dataloader, train, test all rewritten), but see **"Known open
+items"** at the bottom -- there is unresolved training instability, some
+paper-guideline values that were adopted as defaults without dedicated tuning, and
+a couple of pre-existing-but-still-inaccurate leftover comments to be aware of.
 
-| quantity | value | note |
-|---|---|---|
-| wavelength | 635 nm | |
-| simulation grid | `sim_dx=4 um`, `N_sim=2000` | 8.0 x 8.0 mm, angular-spectrum grid |
-| SLM | `slm_dx=8 um`, `slm_x_num=500`, `M=20` | 4.0 x 4.0 mm active; time-multiplexed, `sigmoid(slm_phases)*2pi` |
-| object | `data_x_num=100`, `obj_dx=8 um` | 800 x 800 um phase object, `phi = image * input_phase_max` |
-| phase range | `input_phase_max=pi` | objects span [0, pi] |
-| diffractive layers | `num_layers=0` (off by default) | K learned phase plates between SLM and detector; each `layer_dx=8 um`, `layer_size=500` |
-| propagation | `z_slm_ccd=5.2 cm` (K=0) | with layers: `slm_first_layer_spacing=5 cm`, `interlayer_spacing=15 um`, `last_layer_ccd_spacing=5 cm` |
-| detector array | `pd_num_rows=4`, `pd_num_cols=5`, `photodiode_size=0.1 mm` | 20 detectors, `pd_row/col_spacing=0.2 mm`; rows 0-1 positive, rows 2-3 negative |
-| measurement noise | `meas_noise_std=0` | additive, injected during training only |
-| classes | `num_classes=10`, `T=0.1` | softmax temperature divides the [-1,1] differential contrast |
-| encoder | 20 x 500 x 500 SLM phases | 5.0 M parameters at K=0; + `num_layers * layer_size^2` if diffractive layers are enabled |
-| optimisers | Adam; `lr_slm=1e-2`, `lr_layer=1e-3` | cosine annealing, independent optimizer per parameter group |
-| loss | softmax cross-entropy over differential contrast | `ClassificationLoss`; no reconstruction loss |
-
-## Layout
+## Physical architecture
 
 ```
-code/
-    config.py       every parameter, with CLI overrides via --set KEY=VALUE
-    paths.py        filesystem resolution (environment-overridable)
-    wave_prop.py    band-limited angular-spectrum propagator
-    model.py        TimeMultiplexedClassifier: SLM -> diffractive layers -> 4x5 photodiode array
-    loss.py         ClassificationLoss: differential contrast + softmax cross-entropy
-    dataloader.py   image datasets mapped to phase objects
-    train.py        end-to-end training (SLM + diffractive layers), figures, TensorBoard/wandb logging
-    test.py         evaluation: accuracy, confusion matrix, per-class P/R/F1, misclassified examples
-    finetune.py     not applicable to current project.
+Phase-key plane (LEARNED, T == M keys, time-multiplexed)
+   phi_key ~ sigmoid(slm_phases) * 2*pi          [T, 1, slm_x_num, slm_x_num]
+        |
+        | propagate across key_to_enc_spacing  (FreeSpaceProp)
+        v
+Function-input encoding plane (DETERMINISTIC, NOT learned)
+   phi_in(p; a) = 2*pi * encoding_freq_step * (p-1) * a
+   for p = 1..Np, arranged as an encoding_side x encoding_side square patch
+   (encoding_side = sqrt(Np)); field there = exp(i*phi_key_propagated) * exp(i*phi_in(p;a))
+        |
+        | propagate across slm_first_layer_spacing
+        v
+K learned diffractive layers (shared across all M keys)
+   phi_layer_k ~ sigmoid(layer_phases[k]) * 2*pi   [1, 1, layer_size, layer_size]
+   interleaved with propagation across interlayer_spacing
+        |
+        | propagate across last_layer_ccd_spacing
+        v
+Detector plane: pd_num_rows x pd_num_cols intensity detectors
+   ONE detector per target function: detector (r,c) -> function k = r*pd_num_cols + c
+   pd_num_rows * pd_num_cols MUST equal Nf (asserted in config.recompute_derived)
+        |
+        | (everything above is model.py; everything below is loss.py)
+        v
+Average raw intensity over the M phase keys -> [B, Nf]
+        |
+        v
+Min-max normalize using RUNNING Pmin/Pmax buffers (EMA, momentum=config.norm_momentum)
+        |
+        v
+f_hat(a)  in [0,1]^Nf  <-- compared to the target f(a) via MSE
 ```
 
-The pipeline files sit next to the modules they import, so `train.py` finds `config`,
-`model`, `loss`, `dataloader` and `wave_prop` as plain siblings.
+Both `object_slm_spacing`-style planes from the old classifier (a learned SLM mask,
+then a separate "object" image plane) map directly onto this: the phase-key plane
+plays the SLM's old structural role (learned, propagated, then multiplicatively
+combined with the next plane), and the encoding plane plays the object's old
+structural role (deterministic content, multiplicatively combined) -- **but the
+object's content used to be an image; now it's a formula in `a`.**
 
-## Setup
+## Why this can't reuse the paper's efficient training trick
 
-```bash
-pip install -r requirements.txt
-python code/paths.py            # print every resolved location and whether it exists
+The paper's own training loss (its Eq. 11) never simulates a specific `a` at all --
+it fits the diffractive stack's coherent point-spread function directly to each
+target function's Fourier coefficients in closed form, because with nothing in
+front of the encoding plane, the system is purely linear (coherent field in, coherent
+field out) and matching coefficients guarantees the fit for *every* `a`
+simultaneously. Our design breaks that shortcut in two ways: (1) the phase-key
+plane sits *before* the encoding plane and gets diffraction-propagated onto it, so
+its effect is a fixed-but-nontrivial per-pixel complex weighting that only becomes
+useful with `M > 1` *different* keys; (2) the `M`-key combination happens by
+averaging **intensities** (post-detection), which is a nonlinear (incoherent)
+combination with no closed-form Fourier-coefficient fit. So training here is
+standard forward-simulate-then-backprop (`loss.py`'s MSE against `target_functions`'
+closed-form values), not the paper's shortcut. This is a deliberate, understood
+trade-off, not an oversight.
+
+## Terminology / glossary
+
+| term | meaning |
+|---|---|
+| `a` | scalar input to the target functions, sampled/gridded over `[a_min, a_max]` = `[-0.5, 0.5]` |
+| `Np` | number of input-encoding pixels (paper default 9, a 3x3 patch); must be a perfect square |
+| `Nf` | number of target functions approximated in parallel = number of detectors |
+| `M` | number of learned phase keys (time-multiplexed, our addition, not in the paper) |
+| `K` / `num_layers` | number of learned diffractive surfaces |
+| `T` | total learnable phase-key masks; `T == M` now (see "C is gone" below) |
+| phase key | one learned mask on the plane *before* the encoding plane; there are `M` of them |
+| encoding plane | deterministic plane carrying `phi_in(p;a)`; NOT learned, replaces the old "object" image plane |
+| `f_k(a)` | the k-th true target function, closed-form via `target_functions.TargetFunctionSet` |
+| `f_hat(a)` | the model's optically-simulated, key-averaged, normalized approximation of `f(a)` |
+| "wisdom of the crowd" | averaging M independent (noisy/imperfect) key-conditioned estimates before normalizing, to reduce error |
+| `C` / "countries" | **GONE.** Old classifier concept (independent majority-vote groups); has no meaning for regression. `config.C` was deleted; some code still reads it via `getattr(..., 1)` fallback (harmless, always resolves to 1) |
+
+## Config parameter reference (`code/config.py`)
+
+Every parameter is tagged inline in the file itself:
+- `# PAPER: <value/section>` -- taken directly from the paper
+- `# NOTE: not specified in paper` -- our own choice, paper doesn't fix this
+- `# OBSOLETE` -- classification-era, left in place, safe to delete, not currently read (or only read via a harmless fallback)
+
+Current defaults (paper-scale regime, adopted 2026-09-17):
+
+| category | key params | default | source |
+|---|---|---|---|
+| optics | `wavelength` | 550 nm | PAPER Sec. 2.2 |
+| optics | `pixel_pitch` | `0.55 * wavelength` ~= 302.5 nm | PAPER Sec. 2.2 (shared pitch for input px, output px, AND diffractive feature width) |
+| sim grid | `sim_dx` | `= pixel_pitch` (bin factor 1 everywhere) | derived |
+| sim grid | `N_sim` | 256 | our choice: ~7.5x guard band around the largest single-plane aperture (~34px), FFT-friendly power of 2 |
+| targets | `Np` | 9 (3x3 patch) | PAPER Sec. 2.2, fixed across all their Nf sweeps |
+| targets | `Nf` | 100 | PAPER Fig. 2's smallest tested value (they go up to 1e6) |
+| targets | `a_min`, `a_max` | -0.5, 0.5 | PAPER |
+| targets | `func_seed` | 0 | our reproducibility knob (paper only specifies the sampling distributions, Eq. 10) |
+| phase key | `M` | 1 | our addition, not paper-derived; **the whole point of this project is to sweep this** |
+| layers | `num_layers` (K) | 2 | PAPER's default/main design (K=4 is their deeper alt.) |
+| layers | `layer_size` | `ceil(sqrt(1.25*2*Np*Nf/K))` = 34 | PAPER's guideline `N ~= 1.25*2*Np*Nf` total features -- computed ONCE as a starting default in `init_params()`, NOT re-derived in `recompute_derived()`, so `--set layer_size=X` sticks |
+| spacings | `key_to_enc_spacing`, `slm_first_layer_spacing`, `interlayer_spacing`, `last_layer_ccd_spacing` | all == `z = W*sqrt((2*pixel_pitch/wavelength)^2 - 1)` ~= 4.71 um, `W = layer_size*layer_dx` | PAPER uses ONE uniform value for every plane-to-plane gap (Sec. 2.2); we apply the same value to the key->encoding gap too even though it has no paper analogue |
+| detector | `pd_num_rows`, `pd_num_cols` | 10, 10 (== Nf) | must satisfy `rows*cols == Nf`, asserted |
+| detector | `photodiode_size` | `= pixel_pitch` | PAPER: detector width == delta |
+| detector | `pd_row/col_spacing` | `photodiode_size + 0.5*wavelength` | PAPER: "inter-pixel spacing of ~0.5*lambda" |
+| sampling | `train_a_samples` | 20000 | fixed pool, resampled/reshuffled each epoch (NOT regenerated -- drawn once, seeded by `config.seed`) |
+| sampling | `val_a_grid_size`, `test_a_grid_size` | 1000, 1000 | dense EVENLY-SPACED grids (not random) -- approximates the paper's continuous RMSE integral (Eq. 16) with low variance and gives gap-free plots |
+| loss | `loss_type` | `'mse'` | only `'mse'` is implemented |
+| loss | `norm_momentum` | 0.1 | EMA rate for the running Pmin/Pmax buffers in `loss.py` (analogous to BatchNorm momentum) |
+| training | `batch_size`, `max_epoch`, `lr_slm`, `lr_layer` | 12, 100, 1e-2, 1e-2 | `lr_slm` applies to the phase-key plane (name kept from the old SLM-mask era) |
+
+`recompute_derived(config)` must be called after any `--set` override that changes
+a base physical value (`train.py`/`test.py` already do this) -- it recomputes bin
+factors, `encoding_side`, `T`, `run_name`/log paths, and asserts `Np` is a perfect
+square and `pd_num_rows*pd_num_cols == Nf`.
+
+## File-by-file reference
+
+### `config.py`
+Single source of truth for every parameter (see table above) plus `run_name`/
+log-path construction. `init_params()` builds defaults; `recompute_derived(tc)`
+recomputes everything that depends on base physical values (call this after
+applying `--set` overrides). `config_to_dict(tc)` flattens to a JSON-serializable
+dict for checkpoints/`config.json`.
+
+### `target_functions.py`
+`TargetFunctionSet(config)`: generates `Nf` fixed random Fourier-coefficient sets
+(seeded by `config.func_seed`, PAPER Eq. 10) and evaluates `f_k(a)` in closed form
+(no optical simulation) for any batch of `a`. Calibrates its own global min/max
+(over a dense 2001-point grid) at construction time so `__call__(a)` always
+returns values in `[0,1]`. This is the ONLY source of ground truth; it's shared
+(same object) across train/val/test splits so they all see the same `Nf`
+functions.
+
+### `dataloader.py`
+`FunctionApproxDataset(a_values, target_fn)`: thin wrapper, precomputes targets
+once at construction. `get_function_approx_dataloaders(config)` returns
+`(train_loader, val_loader, test_loader, target_fn)` -- train is a fixed random
+pool (`train_a_samples`, seeded by `config.seed`, reshuffled every epoch by
+`shuffle=True`); val/test are dense `torch.linspace` grids (`shuffle=False`,
+`drop_last=False` so the full grid is always covered, no gaps).
+Old image-dataset classes (MNIST/FashionMNIST/CIFAR10/TinyImageNet/grating) have
+been deleted from this file; a few now-unused imports (`os`, `random`, `Path`,
+`F`, `np`, `torchvision`, `transforms`) are leftover clutter, harmless.
+
+### `model.py`
+`TimeMultiplexedNFA(config)` (renamed from `TimeMultiplexedClassifier`):
+implements exactly the physical path in the diagram above. Key methods:
+- `_encode_input(a)`: builds `phi_in(p;a)` for a batch `a : [B]`, returns
+  `[B, 1, N_sim, N_sim]` (deterministic, no learnable parameters, zero outside the
+  Np-pixel patch)
+- `_get_slm_field()`: the learned phase-key field (still named "slm" internally --
+  same physical SLM hardware, new logical role; NOT renamed to avoid unnecessary
+  attribute churn)
+- `_get_layer_phase(k)`: the k-th learned diffractive layer's field
+- `forward(a, return_field=False) -> I_vec [B, T, pd_num_rows, pd_num_cols]` (or
+  `(I_vec, I_ccd)` if `return_field=True`): the ONLY forward path now -- there is
+  no more "no diffractive layers" bypass (`num_layers > 0` is asserted in
+  `__init__`; `measure()` and `diffraction_efficiency()` were deleted along with
+  it, since both existed solely to support that bypass and neither is called
+  anywhere else)
+
+**model.py returns the RAWEST per-detector intensity. No averaging over M, no
+normalization, no target comparison happens here -- that's all loss.py's job**
+(explicit design decision).
+
+### `loss.py`
+`FunctionApproxLoss(config)`, an `nn.Module` with REAL STATE (`running_min`,
+`running_max`, `_stats_initialized` buffers) -- **train.py must call
+`.train()`/`.eval()` on this module, not just on the model**, or the running
+stats update at the wrong times. Old `ClassificationLoss` has been deleted (was
+already broken -- referenced config attributes the user had removed).
+- `forward(I_vec, target) -> (loss, f_hat)`: averages `I_vec` over the T/M axis
+  (`I_vec.mean(dim=1)`, chosen over `sum` so the intensity scale stays
+  M-invariant -- important since M is the primary thing this project sweeps),
+  reshapes `[B, rows, cols] -> [B, Nf]` (row-major, `k = r*cols + c`), min-max
+  normalizes via the running buffers (updated only when `self.training`), then
+  MSE against `target`
+- `per_function_rmse(f_hat, target)` (`@staticmethod`): `[N, Nf] -> [Nf]`, the
+  diagnostic/plotting metric (paper's Eq. 16-style), NOT the training loss
+
+### `train.py`
+`TimeMultiplexedNFATrainer`, rewritten in place (old classification version not
+kept side-by-side -- a single-entry-point script can't sensibly host two parallel
+`main()`s). **wandb support removed entirely per explicit request -- tensorboard
+only.** Key pieces:
+- `_set_mode(training)`: toggles `.train()`/`.eval()` on BOTH `model` and
+  `criterion` together (see loss.py note above)
+- `train_step(a, target)`: one optimizer step, returns `(loss, key_gnorm,
+  layer_gnorm)`
+- `evaluate(loader, tag='val', plot=True, n_show=4)`: single pass over a whole
+  loader (typically a dense grid) in eval mode; returns `(loss,
+  per_function_rmse)` and optionally saves a target-vs-approximation plot for 4
+  representative functions (best-fit / worst-fit / two mid-error, paper Fig.
+  2b/2c-style) -- this replaced the old per-batch `valid_step` AND the old
+  classification `save_images` diagnostic (deleted, not applicable to regression)
+- checkpoints (`_checkpoint_dict`/`save`/`save_best`/`load`) now also save/restore
+  `criterion.state_dict()` (the running Pmin/Pmax buffers) so a resumed run
+  doesn't lose its calibration; tracks `best_val_loss` (lower is better), not
+  `best_val_acc`
+- `save_phase_keys()` (renamed from `save_slm_masks`): one row of M keys, no more
+  country/member grid
+- `save_layer_masks()`: unchanged in spirit, docstring updated
+
+Usage: `python train.py --set M=5 lr_slm=5e-3` etc. (`--set KEY=VALUE`, any type,
+preserved).
+
+### `test.py`
+Standalone eval script, also rewritten in place. `evaluate(ckpt_path, out_dir,
+csv_path, sweep_name, run_label)`:
+- `_eval_loop`: single pass over the (dense) test loader, returns `agg` dict with
+  `a`/`f_hat`/`target` sorted ascending by `a`, plus per-batch `loss` list
+- `_print_summary` / `_write_csv`: loss + per-function RMSE (mean/max/min) instead
+  of accuracy/confusion-matrix/per-class-F1
+- `_save_error_distribution`: histogram of per-function RMSE (paper Fig. 2a-style)
+- `_save_function_curves`: target-vs-approx curves, same best/worst/mid-error
+  selection as `train.py`'s `evaluate()`
+- `_save_mask_similarity`: pairwise CIRCULAR phase similarity between the M keys
+  (`|mean(exp(i*(phi_i - phi_j)))|`, invariant to a constant phase offset since
+  that cancels under `|field|^2`) -- **low off-diagonal similarity means the keys
+  are learning genuinely different things (good -- the ensembling is doing
+  something); high similarity means the keys are redundant (the M-averaging isn't
+  buying anything).** This is the most direct diagnostic for whether the whole
+  phase-key idea is working.
+- Dropped entirely: dataset selection (`_build_test_loader`, `--dataset` flag --
+  there's no image dataset anymore, the test set is fully determined by config's
+  `Np`/`Nf`/`func_seed`/`test_a_grid_size`), the legacy checkpoint-shape-repair
+  logic (T inferred from `slm_phases.shape[0]` -- was a safety net for older
+  classifier checkpoints, doesn't apply to the new format), the hardcoded stale
+  classifier checkpoint path in `__main__` (now `None`, requires `--ckpt`)
+
+Usage: `python test.py --ckpt logs/<run>/model/best.pth` (outputs default to
+`logs/<run>/test/`; add `--csv path.csv --sweep NAME --label NAME` to append a
+summary row for sweeps across multiple runs).
+
+### `wave_prop.py`
+`FreeSpaceProp(config, z=None)`: band-limited angular-spectrum free-space
+propagator, unchanged by the NFA pivot (already fully general over
+`N_sim`/`sim_dx`/`z`). `z=None` falls back to `config.z_slm_ccd`, which is now
+OBSOLETE (nothing in the current codebase calls `FreeSpaceProp` without an
+explicit `z`) -- harmless dead branch.
+
+### `paths.py`
+Unchanged. Resolves `REPO_ROOT`/`DATA_ROOT`/`CKPT_ROOT`/`LOG_DIR`, overridable via
+`SPQPI_*` env vars. `LOG_DIR = code/logs/` (gitignored). No datasets are needed
+anymore (no image dataset), so `DATA_ROOT` is effectively unused by this pivot,
+but left as-is since other sibling projects may share it.
+
+## Tensor shape cheat-sheet
+
+```
+a (dataloader)                     [B]
+target (dataloader, TargetFunctionSet)   [B, Nf]           in [0,1]
+model._encode_input(a)             [B, 1, N_sim, N_sim]    real phase (radians)
+model._get_slm_field()             [T, 1, N_sim, N_sim]    real phase (radians)
+model.forward(a) -> I_vec          [B, T, pd_num_rows, pd_num_cols]   raw intensity
+loss._detector_to_function(I_vec)  [B, Nf]                  averaged over T, reshaped
+loss.normalize(...)  -> f_hat      [B, Nf]                  in [0,1] (clamped by construction)
+loss.forward(...) -> (loss, f_hat) scalar, [B, Nf]
+per_function_rmse(f_hat, target)   [Nf]
 ```
 
-Set these before anything else; the defaults put everything inside the repo.
+## Known open items (as of this README)
 
-| variable | holds | default |
-|---|---|---|
-| `SPQPI_DATA_ROOT` | object datasets | `<repo>/data` |
-| `SPQPI_CKPT_ROOT` | trained checkpoints | `<repo>/checkpoints` |
-| `SPQPI_PROJECT_ROOT` | parent of the two above | `<repo>` |
-
-The `SPQPI_` prefix is inherited from the project this code came from and is kept
-deliberately, so one set of variables serves both repos on the same machine.
-
-## Datasets
-
-`config.py` expects them under `SPQPI_DATA_ROOT`:
-
-| dataset | path | fetch |
-|---|---|---|
-| FashionMNIST (default) | `FashionMNIST/FashionMNIST/raw/` | `torchvision.datasets.FashionMNIST(root=<DATA_ROOT>/FashionMNIST, download=True)` |
-| MNIST | `MNIST/raw/` | `torchvision.datasets.MNIST(root=..., download=True)` |
-| EMNIST | `EMNIST/` | torchvision |
-| CIFAR-10 | `CIFAR10/` | torchvision |
-| Grating | `Grating/` | generated; the generator is not in this repo |
-
-Images are normalised to [0, 1], resized to the 100 x 100 object region, and mapped
-linearly to phase as `phi = image * input_phase_max`. The label is the integer
-FashionMNIST class (0-9), used directly as the classification target.
-
-## Training
-
-```bash
-cd code
-
-# FashionMNIST (default dataset), no diffractive layers
-python train.py
-
-# with 2 learned diffractive layers between the SLM and the detector array
-python train.py --set num_layers=2
-
-# short smoke run
-python train.py --set max_epoch=1 mnist_cap=200 batch_size=5
-```
-
-`--set KEY=VALUE` overrides any attribute in `config.py`, preserving its type.
-
-**Where output actually lands: `code/logs/<run-name>/`**, holding `model/`, `images/`,
-`tfboard/` and `LOG.txt`. Note this is *not* `paths.LOG_DIR`. `config.py` sets
-`log_dir` from `paths.LOG_DIR` (`<repo>/logs`), but `train.py`'s `main()` rebuilds it
-after applying `--set` overrides so the run name reflects them, and does so relative to
-its own file:
-
-```python
-conv_dir = os.path.dirname(os.path.abspath(__file__))   # .../code
-config.log_dir = os.path.join(conv_dir, 'logs', run_name)
-```
-
-So `paths.LOG_DIR` is effectively dead in that path. Both are covered by the `logs/`
-entry in `.gitignore`, so nothing is at risk of being committed either way. Pass
-`--log_dir` explicitly to put output somewhere else.
-
-`get_dataloaders` dispatches on `config.dataset`: `FashionMNIST` (default),
-`mnist_grating`, `cifar10`, `tinyimagenet`, or anything else (falls through to plain
-`MNISTPhaseDataset`).
-
-Training logs both to TensorBoard (`loss/train`, `loss/val`, `accuracy/train`,
-`accuracy/val`, one event file per run) and to wandb (`project=TimeMultiplexedClassification`,
-same metrics plus `slm_gnorm/train`), gated on whether `wandb.init` succeeds.
-
-## Evaluation
-
-```bash
-python test.py --ckpt ../logs/<run>/model/best.pth
-python test.py --ckpt ../logs/<run>/model/best.pth --dataset mnist   # force a different dataset
-```
-
-With no `--dataset`, `test.py` evaluates against whichever dataset the checkpoint was
-actually trained on (from its saved config); pass `--dataset` to force `mnist`,
-`mnist_grating`, `grating`, `fashion`, `cifar10` or `tinyimagenet` explicitly, e.g. for
-a generalization check. Outputs: an accuracy/loss printout, a per-class
-precision/recall/F1 chart, a row-normalized confusion matrix, a grid of misclassified
-examples, and the learned SLM phase masks.
-
-## Running on yijie
-
-Verified 2 Sept 2026: clone at `C:\luxnet\repos\time-multiplexed-classifier`, conda env
-`qpi` (python 3.12.7, torch 2.5.1+cu121), 2x RTX 4090. All eleven requirements were already
-present in that env. FashionMNIST lives at
-`I:\lab-data\time-multiplexed-classifier\FashionMNIST\FashionMNIST\raw`.
-
-Three environment settings are needed; none require code changes:
-
-```bat
-set "SPQPI_DATA_ROOT=I:\lab-data\time-multiplexed-classifier"
-set "WANDB_MODE=offline"
-set "PYTHONUTF8=1"
-set "PYTHONIOENCODING=utf-8"
-```
-
-`PYTHONUTF8` / `PYTHONIOENCODING` matter because the machine's console codepage is GBK, and
-`train.py` prints a `x` and a superscript-2 in its parameter summary. Without them the run
-dies with `UnicodeEncodeError` before the first step.
-
-**Batch size.** Memory scales with `batch_size * M * (num_layers + 1)` -- the forward
-pass holds `[B, M, N_sim, N_sim]` intensity per propagation hop en route to the detector
-array. The figures below (`23.1 GB @ batch_size=4`, epoch timings) were measured before
-this session's classification pivot, which removed the ~62 M-parameter reconstruction
-decoder that dominated memory at the time -- treat them as rough orientation only, not
-current fact; they have not been re-measured against the current (decoder-free, optionally
-layered) model.
-
-At `batch_size=4` the model used 23.1 GB of the 4090's 24.5 GB. The default `batch_size=5`
-was tuned for a 32 GB card and will very likely OOM here. Throughput at batch 4 was
-~3.8 it/s, so one FashionMNIST epoch (13,500 steps) took ~58 minutes on one GPU.
-
-### Capping the training set
-
-`--set train_samples=N` caps the dataset *before* the train/val split, so
-`validation_ratio` then carves its 10% out of `N`. Use it for quick runs (epoch times
-below carry the same pre-pivot caveat as above):
-
-| `train_samples` | steps @ batch 4 | epoch time on one 4090 |
-|---|---|---|
-| 2,000 | 450 train + 50 val | ~2 min |
-| 5,000 | 1,125 + 125 | ~5 min |
-| 10,000 | 2,250 + 250 | ~11 min |
-| unset (54,000) | 13,500 + 1,500 | ~62 min |
-
-This needed a fix. `_apply_overrides` preserves the type of the existing value, and
-`train_samples` and `mnist_cap` both default to `None` -- neither `bool`, `int` nor
-`float` -- so the override fell through to the string branch and `--set
-train_samples=200` died with `TypeError: slice indices must be integers`. A `None` case
-now coerces to int, then float, then leaves it a string.
-
-
-## Launching detached
-
-An ssh-launched run dies when the session drops. Spawn it so it is not a child of the ssh
-session:
-
-```powershell
-Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-  CommandLine = 'cmd.exe /c C:\luxnet\runs\tmc_smoke.bat' }
-```
-
-The repo is cloned with a read-only deploy key at `C:/luxnet/ssh/id_ed25519_tmc`, wired in
-as `core.sshCommand` in the local clone, so `git pull` works non-interactively and pushes
-from that machine are refused by design.
+- **Training instability observed**, not yet root-caused: a 60-epoch smoke run
+  (M=5, K=2, 256 training samples) had val loss improve steadily through epoch 30
+  (0.0148) then get noticeably WORSE by epoch 50 (0.047) -- training destabilized
+  in the back half rather than converging further. `best.pth`/`save_best()`
+  correctly tracks whichever epoch had the lowest val loss, but this divergence
+  itself (learning rate vs. cosine schedule interaction? gradient blow-up in one
+  of the two parameter groups? running-normalization drift?) hasn't been
+  investigated.
+- **`layer_size`/`slm_x_num` are computed once from the paper's guideline
+  formula and NOT re-derived in `recompute_derived()`** -- if you `--set Np=...`
+  or `--set Nf=...`, you must manually recompute/re-set `layer_size` and
+  `slm_x_num` yourself; they will NOT automatically track the new Np/Nf.
+- **Diffraction-efficiency loss penalty (paper Eq. 13/14, `LDE`) was
+  deliberately NOT implemented** -- explicit decision to keep the first version
+  to plain MSE only; revisit once the core M-key accuracy idea is validated.
+- **`M` default is 1** (no ensembling) -- sweeping M upward is the actual point
+  of this project and hasn't been systematically explored yet; `phase_key_similarity.png`
+  (test.py) is the primary diagnostic for whether increasing M is actually
+  buying diversity or just redundant keys.
+- Config still carries a few small OBSOLETE-tagged leftovers, intentionally not
+  deleted (tracked so you can remove them yourself): `config.z_slm_ccd`, and a
+  stale comment in `recompute_derived()` about `config.C` (the attribute itself
+  is already gone; `model.py`'s `getattr(config, 'C', 1)` fallback makes this
+  harmless).
+- `dataloader.py` still imports `os`/`random`/`Path`/`F`/`np`/`torchvision`/
+  `transforms`, all now unused (leftover from the deleted image-dataset code).
 
 ## Provenance
 
-The nine files in `code/` were copied from
+The original nine files in `code/` were copied from
 [`ary-portes/single-pixel-qpi-paper`](https://github.com/ary-portes/single-pixel-qpi-paper)
-at commit `f5b388c1d8191181444970c7c397b7249aa60fd9` (29 Aug 2026). Since then (Sep 2026)
-the pipeline was pivoted from phase-image reconstruction to classification:
-`config.py`, `model.py`, `loss.py`, `dataloader.py`, `train.py` and `test.py` have all
-been substantially rewritten -- the reconstruction decoder is gone, replaced by a 4x5
-photodiode array, differential-contrast softmax cross-entropy, and optional learned
-diffractive phase layers. `wave_prop.py` gained an optional per-instance `z` argument
-so multiple propagators (different fixed hop distances) can coexist; `paths.py` is
-unchanged from the original copy. 
+(commit `f5b388c1d8191181444970c7c397b7249aa60fd9`, 29 Aug 2026), then pivoted to
+image classification (Sep 2026), then pivoted again to this parallel nonlinear
+function approximation design (17 Sep 2026) -- `config.py`, `model.py`,
+`loss.py`, `dataloader.py`, `train.py`, `test.py` rewritten, `target_functions.py`
+newly added, `wave_prop.py`/`paths.py` unchanged throughout both pivots.
