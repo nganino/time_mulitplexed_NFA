@@ -6,7 +6,9 @@ through successive diffractive phase layers before reaching a differential detec
 Each detector sums the signal acquired across the M phase masks, predicting the object class 
 through the max differential signal of a pair of photodiodes corresponding to the object's class.
 ```
-            phase object + SLM phase bias (M=20 learned masks, time-multiplexed)
+                   SLM phase bias (M=20 learned masks, time-multiplexed)
+                                    |
+                              phase object
                                     |
                     free-space propagation -- K learned diffractive phase
                                     layers in series
