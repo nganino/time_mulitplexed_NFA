@@ -1,0 +1,17 @@
+# time-multiplexed-classifier
+#
+# Verified on yijie: python 3.12.7, torch 2.5.1+cu121, 2x RTX 4090 (conda env `qpi`).
+
+torch>=2.5.1
+torchvision>=0.20
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+scikit-image>=0.21
+pillow>=10.0
+tqdm>=4.65
+configobj>=5.0
+
+# training / experiment tracking (train.py imports these unconditionally)
+tensorboardX>=2.6
+wandb>=0.16

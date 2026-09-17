@@ -1,0 +1,3 @@
+Sweep start 09/16/2026 Wed 18:19:12.41 
+C=1 done 09/17/2026 Thu  0:49:38.25 
+C=3 start (GPU0, parallel) 09/17/2026 Thu  7:44:17.05 

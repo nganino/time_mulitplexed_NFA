@@ -1,0 +1,20 @@
+# training output
+logs/
+runs/
+wandb/
+checkpoints/
+*.pth
+
+# datasets (resolved via SPQPI_DATA_ROOT, never tracked)
+data/
+
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.conda/
+.venv/
+
+# os
+Thumbs.db
+.DS_Store
