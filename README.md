@@ -53,10 +53,12 @@ Detector plane: pd_num_rows x pd_num_cols intensity detectors
 Average raw intensity over the M phase keys -> [B, Nf]
         |
         v
-Min-max normalize using RUNNING Pmin/Pmax buffers (EMA, momentum=config.norm_momentum)
+Learned affine readout: f_hat = I_summed * scale + bias (scale/bias are
+   nn.Parameters, trained by backprop like everything else -- see "Known
+   open items" for why this replaced an EMA-tracked running Pmin/Pmax)
         |
         v
-f_hat(a)  in [0,1]^Nf  <-- compared to the target f(a) via MSE
+f_hat(a)  in [0,1]^Nf (approximately; not hard-clamped) <-- compared to the target f(a) via MSE
 ```
 
 Both `object_slm_spacing`-style planes from the old classifier (a learned SLM mask,
@@ -129,8 +131,8 @@ Current defaults (paper-scale regime, adopted 2026-09-17):
 | sampling | `train_a_samples` | 20000 | fixed pool, resampled/reshuffled each epoch (NOT regenerated -- drawn once, seeded by `config.seed`) |
 | sampling | `val_a_grid_size`, `test_a_grid_size` | 1000, 1000 | dense EVENLY-SPACED grids (not random) -- approximates the paper's continuous RMSE integral (Eq. 16) with low variance and gives gap-free plots |
 | loss | `loss_type` | `'mse'` | only `'mse'` is implemented |
-| loss | `norm_momentum` | 0.1 | EMA rate for the running Pmin/Pmax buffers in `loss.py` (analogous to BatchNorm momentum) |
-| training | `batch_size`, `max_epoch`, `lr_slm`, `lr_layer` | 12, 100, 1e-2, 1e-2 | `lr_slm` applies to the phase-key plane (name kept from the old SLM-mask era) |
+| loss | `norm_momentum` | 0.1 | **OBSOLETE** -- was the EMA rate for the old running Pmin/Pmax buffers; `loss.py` now uses a learned scale/bias instead (see "Known open items") |
+| training | `batch_size`, `max_epoch`, `lr_slm`, `lr_layer` | 12, 100, 1e-2, 1e-2 | `lr_slm` applies to the phase-key plane (name kept from the old SLM-mask era); also reused as the LR for `loss.py`'s learned scale/bias (`opt_readout` in `train.py`) |
 
 `recompute_derived(config)` must be called after any `--set` override that changes
 a base physical value (`train.py`/`test.py` already do this) -- it recomputes bin
@@ -188,39 +190,48 @@ normalization, no target comparison happens here -- that's all loss.py's job**
 (explicit design decision).
 
 ### `loss.py`
-`FunctionApproxLoss(config)`, an `nn.Module` with REAL STATE (`running_min`,
-`running_max`, `_stats_initialized` buffers) -- **train.py must call
-`.train()`/`.eval()` on this module, not just on the model**, or the running
-stats update at the wrong times. Old `ClassificationLoss` has been deleted (was
-already broken -- referenced config attributes the user had removed).
+`FunctionApproxLoss(config)`, an `nn.Module` with two of its own learnable
+parameters (`_raw_scale`, `bias` -- a global affine readout, see "Known open
+items" below for why). Old `ClassificationLoss` has been deleted (was already
+broken -- referenced config attributes the user had removed).
 - `forward(I_vec, target) -> (loss, f_hat)`: averages `I_vec` over the T/M axis
   (`I_vec.mean(dim=1)`, chosen over `sum` so the intensity scale stays
   M-invariant -- important since M is the primary thing this project sweeps),
-  reshapes `[B, rows, cols] -> [B, Nf]` (row-major, `k = r*cols + c`), min-max
-  normalizes via the running buffers (updated only when `self.training`), then
-  MSE against `target`
+  reshapes `[B, rows, cols] -> [B, Nf]` (row-major, `k = r*cols + c`), applies
+  `f_hat = I_summed * scale + bias` (learned, `scale = softplus(_raw_scale)` to
+  stay positive), then MSE against `target`
 - `per_function_rmse(f_hat, target)` (`@staticmethod`): `[N, Nf] -> [Nf]`, the
   diagnostic/plotting metric (paper's Eq. 16-style), NOT the training loss
+- `scale`/`bias` are trained by their own optimizer (`train.py`'s
+  `opt_readout`/`sched_readout`, reusing `lr_slm`'s LR) and round-trip through
+  checkpoints via `criterion.state_dict()`
 
 ### `train.py`
 `TimeMultiplexedNFATrainer`, rewritten in place (old classification version not
 kept side-by-side -- a single-entry-point script can't sensibly host two parallel
 `main()`s). **wandb support removed entirely per explicit request -- tensorboard
 only.** Key pieces:
-- `_set_mode(training)`: toggles `.train()`/`.eval()` on BOTH `model` and
-  `criterion` together (see loss.py note above)
-- `train_step(a, target)`: one optimizer step, returns `(loss, key_gnorm,
-  layer_gnorm)`
+- `_set_mode(training)`: toggles `.train()`/`.eval()` on `model` and `criterion`
+  together (kept as good habit -- no longer functionally required now that
+  `criterion` has no training-mode-dependent state, see loss.py note above)
+- `_init_optimizers()`: THREE optimizer/scheduler pairs now --
+  `opt_slm`/`sched_slm` (phase-key plane), `opt_layers`/`sched_layers`
+  (diffractive layers, always present), `opt_readout`/`sched_readout`
+  (loss.py's scale/bias, reuses `lr_slm`'s LR) -- `self.criterion` is
+  constructed BEFORE `_init_optimizers()` is called (order matters:
+  `opt_readout` needs `self.criterion.parameters()` to already exist)
+- `train_step(a, target)`: one optimizer step across all three groups, returns
+  `(loss, key_gnorm, layer_gnorm)`
 - `evaluate(loader, tag='val', plot=True, n_show=4)`: single pass over a whole
   loader (typically a dense grid) in eval mode; returns `(loss,
   per_function_rmse)` and optionally saves a target-vs-approximation plot for 4
   representative functions (best-fit / worst-fit / two mid-error, paper Fig.
   2b/2c-style) -- this replaced the old per-batch `valid_step` AND the old
   classification `save_images` diagnostic (deleted, not applicable to regression)
-- checkpoints (`_checkpoint_dict`/`save`/`save_best`/`load`) now also save/restore
-  `criterion.state_dict()` (the running Pmin/Pmax buffers) so a resumed run
-  doesn't lose its calibration; tracks `best_val_loss` (lower is better), not
-  `best_val_acc`
+- checkpoints (`_checkpoint_dict`/`save`/`save_best`/`load`) also save/restore
+  `criterion.state_dict()` (the learned scale/bias) and `opt_readout`/
+  `sched_readout` so a resumed run doesn't lose its calibration; tracks
+  `best_val_loss` (lower is better), not `best_val_acc`
 - `save_phase_keys()` (renamed from `save_slm_masks`): one row of M keys, no more
   country/member grid
 - `save_layer_masks()`: unchanged in spirit, docstring updated
@@ -238,6 +249,15 @@ csv_path, sweep_name, run_label)`:
 - `_save_error_distribution`: histogram of per-function RMSE (paper Fig. 2a-style)
 - `_save_function_curves`: target-vs-approx curves, same best/worst/mid-error
   selection as `train.py`'s `evaluate()`
+- `_save_error_heatmap` (added 2026-09-18): spatial map of per-function RMSE laid
+  out on the physical detector plane -- reshapes the `[Nf]` RMSE vector back into
+  the `pd_num_rows x pd_num_cols` grid (`k = r*cols + c`, same indexing as
+  `model.py`), positions it using the true `pd_row_spacing`/`pd_col_spacing`, and
+  lets `imshow(..., interpolation='bilinear')` smooth between the discrete
+  detectors purely for legibility (real detector centers are overlaid as dots so
+  the interpolated fill is never mistaken for an actual measurement). Deliberately
+  dependency-light: matplotlib's own `'hot'` colormap and bilinear resampling, no
+  `scipy`/custom colormap.
 - `_save_mask_similarity`: pairwise CIRCULAR phase similarity between the M keys
   (`|mean(exp(i*(phi_i - phi_j)))|`, invariant to a constant phase offset since
   that cancels under `|field|^2`) -- **low off-diagonal similarity means the keys
@@ -278,21 +298,67 @@ model._encode_input(a)             [B, 1, N_sim, N_sim]    real phase (radians)
 model._get_slm_field()             [T, 1, N_sim, N_sim]    real phase (radians)
 model.forward(a) -> I_vec          [B, T, pd_num_rows, pd_num_cols]   raw intensity
 loss._detector_to_function(I_vec)  [B, Nf]                  averaged over T, reshaped
-loss.normalize(...)  -> f_hat      [B, Nf]                  in [0,1] (clamped by construction)
+loss.normalize(...)  -> f_hat      [B, Nf]                  ~[0,1], learned affine, NOT hard-clamped
 loss.forward(...) -> (loss, f_hat) scalar, [B, Nf]
 per_function_rmse(f_hat, target)   [Nf]
 ```
 
 ## Known open items (as of this README)
 
-- **Training instability observed**, not yet root-caused: a 60-epoch smoke run
-  (M=5, K=2, 256 training samples) had val loss improve steadily through epoch 30
-  (0.0148) then get noticeably WORSE by epoch 50 (0.047) -- training destabilized
-  in the back half rather than converging further. `best.pth`/`save_best()`
-  correctly tracks whichever epoch had the lowest val loss, but this divergence
-  itself (learning rate vs. cosine schedule interaction? gradient blow-up in one
-  of the two parameter groups? running-normalization drift?) hasn't been
-  investigated.
+- ~~Training instability~~ **RESOLVED (2026-09-17).** A 60-epoch smoke run (M=5)
+  had val loss improve then get noticeably worse. A 5-point LR sweep at M=1
+  (`logs/lr_sweep_M1/`, 1e-2 down to 1e-4) showed the SAME qualitative failure
+  at every LR (violent spikes at high LR -- val loss hit 146 at one point,
+  impossible for a bounded-[0,1] MSE -- down to a slower but still-present
+  late-training climb at 1e-4), which ruled out "LR too high" as the sole
+  cause. Loading the saved checkpoints and inspecting the old
+  `criterion.running_min`/`running_max` directly showed why: raw detector
+  power collapsed by 3-6 orders of magnitude over training and swung by up to
+  ~1000x between checkpoints just a few epochs apart (nothing in the loss
+  constrained overall optical power), and the EMA-based running Pmin/Pmax
+  normalizer (fixed momentum, out-of-loop) couldn't track those sudden swings,
+  so its denominator was sometimes badly mismatched with the current scale --
+  producing exactly this kind of blow-up.
+
+  **Fix:** `loss.py`'s running Pmin/Pmax buffers were replaced with a LEARNED
+  affine readout (`scale`/`bias`, trained by backprop via `train.py`'s new
+  `opt_readout`, see loss.py's module docstring for the full writeup). A
+  second, otherwise-identical LR sweep (`logs/lr_sweep_M1_learnedscale/`)
+  confirmed the fix: every one of the 5 LRs now converges smoothly and
+  monotonically over all 150 epochs -- zero spikes, train/val loss track each
+  other closely throughout, and results now order sanely by LR (higher LR
+  reaches a better minimum within the fixed epoch budget: lr=1e-2 final loss
+  0.00206 vs the old EMA version's best-epoch loss of 0.0188, roughly a 9x
+  improvement, with lr=1e-4 at the other end at 0.0173). Side-by-side plot:
+  `logs/lr_sweep_before_after.png`.
+
+  **Gotcha for future readers:** both of these LR sweeps (`logs/lr_sweep_M1/`
+  and `logs/lr_sweep_M1_learnedscale/`) were actually run with
+  `train_a_samples=512`, `batch_size=16` (32 batches/epoch) -- NOT the
+  config.py defaults (20000 / 12). This wasn't a deliberate choice, it just
+  wasn't noticed until the much-larger-scale sweep below made the mismatch
+  obvious. Don't treat those two sweeps' absolute loss/RMSE numbers as
+  representative of the real default sample budget -- check each run's own
+  `config.json` before comparing across sweeps in this repo.
+- **`train_a_samples` sweep (2026-09-18, M=1, lr=1e-2, `batch_size=64`, 150
+  epochs, `logs/trainA_sweep_M1/`)**: 20000/30000/40000/50000 samples/epoch
+  gave rmse_mean 0.00454 / 0.00328 / 0.00337 / 0.00282 respectively (plot:
+  `logs/trainA_sweep_M1/trainA_sweep_rmse.png`). Two takeaways: (1) the big
+  win is going from a badly-undersampled regime (the 512-sample LR sweeps
+  above, rmse_mean 0.044) up to ~20k -- roughly 10x -- but (2) *within*
+  20k-50k, further increases give small, noisy returns (max RMSE isn't even
+  monotonic). `train_a_samples` looks like a mostly-exhausted lever now; best
+  result so far (50k) is still ~4 orders of magnitude off the paper's
+  reported ~1e-7 RMSE for Nf=100. See `code/logs/SWEEP_HANDOVER.txt` for the
+  fuller experiment log and suggested next directions (deviating from the
+  paper's spacing defaults, then sweeping `M`).
+- **GPU utilization / `batch_size`**: the config default `batch_size=12` only
+  reaches ~36-39% utilization on an RTX 4090 for this model size (kernel-launch
+  overhead dominates at such a small batch) -- `batch_size=64` was found to
+  give roughly 4.5x the throughput (~5700 vs ~1250 samples/s) and is now the
+  batch size used for sweeps in this repo, though `config.py`'s own default is
+  left at 12 (not changed without being asked). Worth re-benchmarking batch
+  size again if the model's shape (`Np`/`Nf`/`layer_size`/`M`) changes a lot.
 - **`layer_size`/`slm_x_num` are computed once from the paper's guideline
   formula and NOT re-derived in `recompute_derived()`** -- if you `--set Np=...`
   or `--set Nf=...`, you must manually recompute/re-set `layer_size` and
@@ -301,14 +367,26 @@ per_function_rmse(f_hat, target)   [Nf]
   deliberately NOT implemented** -- explicit decision to keep the first version
   to plain MSE only; revisit once the core M-key accuracy idea is validated.
 - **`M` default is 1** (no ensembling) -- sweeping M upward is the actual point
-  of this project and hasn't been systematically explored yet; `phase_key_similarity.png`
+  of this project and hasn't been systematically explored yet (all sweeps so
+  far, incl. the ones above, are still M=1 groundwork); `phase_key_similarity.png`
   (test.py) is the primary diagnostic for whether increasing M is actually
   buying diversity or just redundant keys.
+- **`key_to_enc_spacing` sweep (2026-09-18, complete, M=1, 20k samples,
+  `logs/keyspacing_sweep_M1/`)**: deliberately deviating from the paper's
+  uniform-spacing choice for just this one gap (phase-key -> encoding plane,
+  which has no paper analogue anyway), scaling the paper-derived default
+  (~4.71 um) by 0.5x/1x/2x/3x/5x. Result: a clear non-monotonic dip at 2x
+  (rmse_mean 0.00338, rmse_max 0.01089 -- best of the 5) with both smaller
+  (0.5x/1x) and larger (3x/5x) spacings worse on both metrics -- looks like
+  a real interior optimum, not a "more/less is always better" trend. Plot:
+  `logs/keyspacing_sweep_M1/keyspacing_sweep_rmse.png`. See
+  `code/logs/SWEEP_HANDOVER.txt` for the full numbers and the suggested
+  narrower follow-up sweep (around 1.5x-2.5x).
 - Config still carries a few small OBSOLETE-tagged leftovers, intentionally not
-  deleted (tracked so you can remove them yourself): `config.z_slm_ccd`, and a
-  stale comment in `recompute_derived()` about `config.C` (the attribute itself
-  is already gone; `model.py`'s `getattr(config, 'C', 1)` fallback makes this
-  harmless).
+  deleted (tracked so you can remove them yourself): `config.z_slm_ccd`,
+  `config.norm_momentum` (see the loss.py rewrite above), and a stale comment
+  in `recompute_derived()` about `config.C` (the attribute itself is already
+  gone; `model.py`'s `getattr(config, 'C', 1)` fallback makes this harmless).
 - `dataloader.py` still imports `os`/`random`/`Path`/`F`/`np`/`torchvision`/
   `transforms`, all now unused (leftover from the deleted image-dataset code).
 

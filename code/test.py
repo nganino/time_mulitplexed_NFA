@@ -6,9 +6,12 @@ Usage:
     python test.py --ckpt logs/.../model/epoch=050.pth --out_dir out/
 
 Outputs saved to <out_dir>/:
-    test_error_distribution.png — histogram of per-function RMSE (Fig. 2a-style)
-    test_function_curves.png    — target-vs-approximation curves for representative
-                                   functions (best-fit / worst-fit / mid-error, Fig. 2b/2c-style)
+    test_summary.png            — combined summary figure (see _save_test_summary):
+                                   error-distribution histogram (top-left), spatial
+                                   RMSE heatmap over the detector plane (top-right),
+                                   and target-vs-approx curves for representative
+                                   functions -- best-fit / worst-fit / mid-error
+                                   (bottom row, paper Fig. 2a/2b/2c-style)
     phase_keys_final.png        — learned phase-key masks (one per key, M total)
     layer_masks_final.png       — learned diffractive-layer phase masks
     phase_key_similarity.png    — pairwise phase similarity between the M keys
@@ -36,6 +39,8 @@ import torch
 import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.ticker import FuncFormatter
 
 from config import init_params, recompute_derived
 from model import TimeMultiplexedNFA
@@ -105,48 +110,107 @@ def _print_summary(agg, tag='Test'):
 
 # ──────────────────────────── save figures ────────────────────────────────── #
 
-def _save_error_distribution(rmse, save_path, dpi=200):
-    '''Histogram of per-function approximation error (paper Fig. 2a-style).'''
-    rmse_np = rmse.numpy()
-    fig, ax = plt.subplots(figsize=(6, 4), dpi=dpi)
-    ax.hist(rmse_np, bins=min(30, max(len(rmse_np), 1)), color='steelblue', alpha=0.85)
-    ax.axvline(rmse_np.mean(), color='crimson', linestyle='--',
-               label=f'mean={rmse_np.mean():.3f}')
-    ax.set_xlabel('RMSE'); ax.set_ylabel('# functions')
-    ax.set_title(f'Function approximation error distribution (Nf={len(rmse_np)})', fontsize=10)
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(save_path, bbox_inches='tight')
-    plt.close(fig)
-    print(f'Error distribution saved → {save_path}')
+def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
+    '''
+    Combined test-summary figure -- one PNG instead of three separate files:
+      - top-left:  histogram of per-function RMSE (paper Fig. 2a-style)
+      - top-right: spatial map of per-function RMSE over the detector plane
+      - bottom row (full width): target-vs-approx curves for representative
+        functions -- best-fit, worst-fit, and two spread across the middle
+        of the error distribution (paper Fig. 2b/2c-style)
 
-
-def _save_function_curves(agg, rmse, save_path, n_show=4, dpi=150):
-    '''Target-vs-approximation curves for representative functions -- best-fit,
-    worst-fit, and a couple spread across the middle of the error distribution
-    (paper Fig. 2b/2c-style).'''
+    All RMSE values shown as text (titles/legends) use scientific notation
+    (`.2e`) rather than fixed-point -- at the accuracy this project now
+    reaches (down to ~1e-6/1e-7 after fixing detector crosstalk, see
+    logs/SWEEP_HANDOVER.txt), `.3f`/`.4f` formatting would just print
+    "0.000" and hide the actual value.
+    '''
     a, f_hat, target = agg['a'].numpy(), agg['f_hat'].numpy(), agg['target'].numpy()
+    rmse_np = rmse.numpy()
     Nf = rmse.shape[0]
-    order_by_err = torch.argsort(rmse)
-    show_idx = sorted(set(int(order_by_err[i]) for i in
-                           [0, Nf // 3, 2 * Nf // 3, Nf - 1]))[:n_show]
 
-    fig, axes = plt.subplots(1, len(show_idx), figsize=(4 * len(show_idx), 3.2),
-                              dpi=dpi, squeeze=False)
+    fig = plt.figure(figsize=(4 * n_show, 7.2), dpi=dpi)
+    gs = fig.add_gridspec(2, n_show, height_ratios=[1.15, 1])
+    half = n_show // 2   # top row splits n_show columns into left/right halves
+
+    # ---- top-left: error distribution histogram ----------------------------
+    ax_hist = fig.add_subplot(gs[0, :half])
+    ax_hist.hist(rmse_np, bins=min(30, max(len(rmse_np), 1)), color='steelblue', alpha=0.85)
+    ax_hist.axvline(rmse_np.mean(), color='crimson', linestyle='--',
+                     label=f'mean={rmse_np.mean():.2e}')
+    ax_hist.set_xlabel('RMSE'); ax_hist.set_ylabel('# functions')
+    ax_hist.set_title(f'Error distribution (Nf={len(rmse_np)})', fontsize=10)
+    ax_hist.legend(fontsize=8)
+
+    # ---- top-right: spatial error heatmap -----------------------------------
+    # Detector (r, c) reads function k = r*pd_num_cols + c (matches model.py's
+    # _integrate_photodiode_array), so the RMSE vector reshapes straight into
+    # that grid and is placed at the detectors' true physical spacing.
+    # Detectors don't tile the plane (real gap = pd_row/col_spacing -
+    # photodiode_size, see config.py) -- imshow's own bilinear resampling
+    # fills that gap purely for legibility (a visualization smoothing, not a
+    # physical measurement), and the true detector footprints are drawn to
+    # scale (actual photodiode_size, not a cosmetic marker) so the real fill
+    # factor is visible.
+    ax_heat = fig.add_subplot(gs[0, half:])
+    rows, cols = config.pd_num_rows, config.pd_num_cols
+    grid = rmse_np.reshape(rows, cols)   # row-major k = r*cols + c, matches model.py
+
+    height_um = (rows - 1) * config.pd_row_spacing * 1e6
+    width_um  = (cols - 1) * config.pd_col_spacing * 1e6
+    extent    = [-width_um / 2, width_um / 2, -height_um / 2, height_um / 2]
+
+    im = ax_heat.imshow(grid, cmap='hot', origin='lower', extent=extent,
+                         interpolation='bilinear')
+    ys = np.linspace(-height_um / 2, height_um / 2, rows)
+    xs = np.linspace(-width_um / 2, width_um / 2, cols)
+    pd_w_um = config.photodiode_size * 1e6
+    for yy in ys:
+        for xx in xs:
+            ax_heat.add_patch(Rectangle(
+                (xx - pd_w_um / 2, yy - pd_w_um / 2), pd_w_um, pd_w_um,
+                facecolor='none', edgecolor='white', linewidth=0.7, alpha=0.85))
+    ax_heat.set_xlabel('detector-plane x (µm)')
+    ax_heat.set_ylabel('detector-plane y (µm)')
+    ax_heat.set_title('Spatial RMSE map (interpolated between detectors)', fontsize=10)
+    cbar = fig.colorbar(im, ax=ax_heat, fraction=0.046, pad=0.04)
+    cbar.set_label('RMSE')
+    # Format each tick as its own scientific-notation value rather than a
+    # shared power-of-ten offset -- matplotlib's default offset text box
+    # renders right above the axes and collides with the title above at the
+    # tiny RMSE values this project now reaches (~1e-6/1e-7).
+    cbar.formatter = FuncFormatter(lambda val, pos: f'{val:.1e}')
+    cbar.update_ticks()
+
+    # ---- bottom row: target-vs-approx curves --------------------------------
+    # Rank-based labels come from the ERROR-sorted position (index 0 = best
+    # fit, Nf-1 = worst fit) -- assigned here, before `show_idx` gets re-sorted
+    # by function id `k` for left-to-right display order, so the label always
+    # reflects true error rank regardless of display order.
+    order_by_err = torch.argsort(rmse)
+    rank_positions = [0, Nf // 3, 2 * Nf // 3, Nf - 1]
+    rank_labels    = ['best', 'middle', 'middle', 'worst']
+    label_of = {}
+    for pos, lab in zip(rank_positions, rank_labels):
+        k = int(order_by_err[pos])
+        label_of.setdefault(k, lab)   # keep first label if Nf is small enough to collide
+    show_idx = sorted(label_of.keys())[:n_show]
+
     for i, k in enumerate(show_idx):
-        ax = axes[0, i]
+        ax = fig.add_subplot(gs[1, i])
         ax.plot(a, target[:, k], '--', color='tab:green', label='target')
         ax.plot(a, f_hat[:, k], '-.', color='tab:red', label='approx')
-        ax.set_title(f'f_{k}  (RMSE={rmse[k]:.3f})', fontsize=9)
+        ax.set_title(f'f_{k}  (RMSE={rmse[k]:.2e}) [{label_of[k]}]', fontsize=9)
         ax.set_xlabel('a'); ax.set_ylim(-0.05, 1.05)
         if i == 0:
             ax.legend(fontsize=7)
-    fig.suptitle(f'Function approximation (test)  mean RMSE={rmse.mean():.4f}  '
-                 f'max RMSE={rmse.max():.4f}')
-    fig.tight_layout()
+
+    fig.suptitle(f'Test summary   mean RMSE={rmse.mean():.2e}   max RMSE={rmse.max():.2e}',
+                 fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(save_path, bbox_inches='tight')
     plt.close(fig)
-    print(f'Function-approximation curves saved → {save_path}')
+    print(f'Test summary saved → {save_path}')
 
 
 def _save_mask_similarity(model, out_dir, dpi=200):
@@ -326,8 +390,7 @@ def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_l
     if csv_path is not None:
         _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse)
 
-    _save_error_distribution(rmse, os.path.join(out_dir, 'test_error_distribution.png'))
-    _save_function_curves(agg, rmse, os.path.join(out_dir, 'test_function_curves.png'))
+    _save_test_summary(agg, rmse, config, os.path.join(out_dir, 'test_summary.png'))
 
     # ── Phase keys / layers / key similarity ───────────────────────────────
     _save_phase_keys(model, out_dir)

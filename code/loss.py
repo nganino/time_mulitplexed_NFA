@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # =========================================================================== #
 #  NONLINEAR FUNCTION APPROXIMATION (NFA) -- loss                             #
@@ -12,17 +13,32 @@ import torch.nn as nn
 #    2. flatten the detector grid to one value per target function, k = r *  #
 #       pd_num_cols + c (config.py's stated convention -- a plain reshape,   #
 #       since PyTorch's reshape is row-major)                                #
-#    3. min-max normalize into f_hat(a) using RUNNING Pmin/Pmax buffers       #
-#       (paper Eq. 9, made "online" via an EMA -- not specified in paper,    #
-#       see design discussion) -- updated only while self.training is True,  #
-#       frozen at eval                                                       #
+#    3. affine-normalize into f_hat(a) = I_summed * scale + bias (paper      #
+#       Eq. 9's min-max idea, but scale/bias are LEARNED parameters, updated #
+#       by backprop alongside the phases -- NOT an EMA of running Pmin/Pmax  #
+#       batch statistics, see design discussion below)                       #
 #    4. MSE against the target (already normalized to [0,1] by               #
 #       target_functions.TargetFunctionSet)                                  #
 #                                                                              #
-#  IMPORTANT: this module has real state (the running buffers), so           #
-#  train.py must call .train() / .eval() on the LOSS module too, not just    #
-#  the model -- otherwise running-stat updates would (or wouldn't) happen    #
-#  at the wrong times.                                                       #
+#  HISTORY: this used to track running_min/running_max via an EMA (momentum  #
+#  = config.norm_momentum, now OBSOLETE/unused), updated only during         #
+#  training and frozen at eval -- mirroring the paper's Eq. 9 more literally.#
+#  A learning-rate sweep at M=1 (2026-09-17) showed val loss spiking to      #
+#  values like 146 (impossible for a bounded-[0,1] MSE) at EVERY tested LR,  #
+#  just less violently at lower LR. Inspecting checkpoints directly showed   #
+#  why: raw detector power collapses by 3-6 orders of magnitude over         #
+#  training AND swings unpredictably by up to ~1000x between checkpoints few #
+#  epochs apart -- nothing in the loss constrained overall optical power, so #
+#  the optimizer was free to let it wander. The EMA (a fixed-momentum,       #
+#  out-of-loop tracker) couldn't react fast enough to those sudden swings,   #
+#  so for a batch or two the normalization denominator was badly mismatched #
+#  with the current scale, producing exactly these blow-ups. Replacing it   #
+#  with a plain LEARNED affine transform removes that failure mode: scale/  #
+#  bias move smoothly via the SAME gradient descent as everything else (no  #
+#  separate momentum hyperparameter to desync), while still preserving the   #
+#  reason Eq. 9-style normalization exists in the first place -- the model   #
+#  only has to learn the right *shape* of f(a), not hit an absolute physical #
+#  intensity unit.                                                           #
 # =========================================================================== #
 
 class FunctionApproxLoss(nn.Module):
@@ -44,14 +60,17 @@ class FunctionApproxLoss(nn.Module):
         assert self.loss_type == 'mse', f"only 'mse' is implemented, got {self.loss_type!r}"
         self.mse_fn = nn.MSELoss()
 
-        self.eps = 1e-8
-        # NOTE: not defined in paper -- EMA rate for the running Pmin/Pmax
-        # buffers (analogous to BatchNorm momentum), see config.norm_momentum.
-        self.momentum = float(getattr(config, 'norm_momentum', 0.1))
+        # Learned affine readout: f_hat = I_summed * scale + bias. scale is
+        # parameterized through softplus to stay positive (higher intensity
+        # -> higher f_hat, a monotonic mapping) and numerically stable; both
+        # are trained by backprop like any other parameter (see train.py's
+        # opt_readout). Init: scale=1, bias=0 (raw_scale = softplus^-1(1)).
+        self._raw_scale = nn.Parameter(torch.tensor(0.5413))
+        self.bias       = nn.Parameter(torch.zeros(()))
 
-        self.register_buffer('running_min', torch.zeros(()))
-        self.register_buffer('running_max', torch.ones(()))
-        self.register_buffer('_stats_initialized', torch.tensor(False))
+    @property
+    def scale(self):
+        return F.softplus(self._raw_scale)
 
     def _detector_to_function(self, I_vec):
         '''
@@ -63,26 +82,10 @@ class FunctionApproxLoss(nn.Module):
         I_mean = I_vec.mean(dim=1)          # [B, rows, cols] -- average over phase keys
         return I_mean.reshape(B, self.Nf)   # [B, Nf], k = r * cols + c
 
-    def _update_running_stats(self, I_summed):
-        batch_min = I_summed.min().detach()
-        batch_max = I_summed.max().detach()
-        if not bool(self._stats_initialized):
-            self.running_min.copy_(batch_min)
-            self.running_max.copy_(batch_max)
-            self._stats_initialized.fill_(True)
-        else:
-            self.running_min.mul_(1 - self.momentum).add_(self.momentum * batch_min)
-            self.running_max.mul_(1 - self.momentum).add_(self.momentum * batch_max)
-
     def normalize(self, I_summed):
-        '''
-        PAPER Eq. 9 min-max normalization, using running Pmin/Pmax stats
-        (updated during training via self.training, frozen at eval).
-        '''
-        if self.training:
-            self._update_running_stats(I_summed)
-        denom = (self.running_max - self.running_min).clamp(min=self.eps)
-        return (I_summed - self.running_min) / denom
+        '''Learned affine transform -- see module-level HISTORY comment for
+        why this replaced an EMA-tracked running Pmin/Pmax.'''
+        return I_summed * self.scale + self.bias
 
     def forward(self, I_vec, target):
         '''

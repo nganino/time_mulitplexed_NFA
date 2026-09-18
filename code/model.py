@@ -251,8 +251,6 @@ class TimeMultiplexedNFA(nn.Module):
         U_in_exp = torch.exp(1j * phi_in_sim).expand(-1, self.T, -1, -1) # [B, T, N_sim, N_sim]
         U_flat = (U_at_enc_exp * U_in_exp).reshape(B * self.T, 1, self.N_sim, self.N_sim)
 
-        # Propagate through the diffractive layers before the CCD (no
-        # no-layers bypass anymore -- num_layers > 0 is asserted in __init__).
         field = self.prop_to_layer1(U_flat)
         for k in range(self.num_layers):
             layer_phase = self._get_layer_phase(k)

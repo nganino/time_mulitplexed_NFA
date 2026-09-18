@@ -85,8 +85,9 @@ class TimeMultiplexedNFATrainer:
         self.best_val_loss = float('inf')
 
         self.model     = self._init_model()
-        self.opt_slm, self.opt_layers, self.sched_slm, self.sched_layers = self._init_optimizers()
         self.criterion = FunctionApproxLoss(config).to(self.device)
+        (self.opt_slm, self.opt_layers, self.opt_readout,
+         self.sched_slm, self.sched_layers, self.sched_readout) = self._init_optimizers()
 
         if config.ckpt_to_load is not None:
             print(f'Loading checkpoint: {config.ckpt_to_load}')
@@ -131,14 +132,26 @@ class TimeMultiplexedNFATrainer:
             opt_layers, T_max=self.config.max_epoch, eta_min=1e-5
         )
 
-        return opt_slm, opt_layers, sched_slm, sched_layers
+        # Learned affine readout (loss.py's scale/bias, replaced the old EMA
+        # running Pmin/Pmax -- see loss.py's module docstring for why). Just
+        # two scalars with a very direct, well-conditioned gradient; reuses
+        # lr_slm's LR since there's no strong reason for a dedicated knob.
+        opt_readout = torch.optim.Adam(
+            self.criterion.parameters(), lr=self.config.lr_slm, betas=(0.9, 0.999)
+        )
+        sched_readout = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_readout, T_max=self.config.max_epoch, eta_min=1e-5
+        )
+
+        return opt_slm, opt_layers, opt_readout, sched_slm, sched_layers, sched_readout
 
     # ---------------------------------------------------------------------- #
 
     def _set_mode(self, training):
-        '''Toggle train()/eval() on BOTH the model and the loss module --
-        the loss module holds real state (running Pmin/Pmax buffers, see
-        loss.py) that must only update during training.'''
+        '''Toggle train()/eval() on both the model and the loss module. The
+        loss module no longer holds training-mode-dependent state (its old
+        running Pmin/Pmax buffers were replaced by a learned scale/bias, see
+        loss.py) -- this is kept mainly for good habit / future-proofing.'''
         if training:
             self.model.train(); self.criterion.train()
         else:
@@ -152,6 +165,7 @@ class TimeMultiplexedNFATrainer:
         if self.opt_slm is not None:
             self.opt_slm.zero_grad(set_to_none=True)
         self.opt_layers.zero_grad(set_to_none=True)
+        self.opt_readout.zero_grad(set_to_none=True)
 
         I_vec = self.model(a)
         loss, _ = self.criterion(I_vec, target)
@@ -165,6 +179,7 @@ class TimeMultiplexedNFATrainer:
         if self.opt_slm is not None:
             self.opt_slm.step()
         self.opt_layers.step()
+        self.opt_readout.step()
 
         return loss.item(), slm_gnorm, layer_gnorm
 
@@ -220,12 +235,12 @@ class TimeMultiplexedNFATrainer:
                          color='tab:green', label='target')
                 ax.plot(a_sorted.numpy(), fhat_sorted[:, k].numpy(), '-.',
                          color='tab:red', label='approx')
-                ax.set_title(f'f_{k}  (RMSE={rmse[k]:.3f})', fontsize=9)
+                ax.set_title(f'f_{k}  (RMSE={rmse[k]:.2e})', fontsize=9)
                 ax.set_xlabel('a'); ax.set_ylim(-0.05, 1.05)
                 if i == 0:
                     ax.legend(fontsize=7)
             fig.suptitle(f'Function approximation ({tag}, epoch {self.epoch})  '
-                         f'mean RMSE={rmse.mean():.4f}  max RMSE={rmse.max():.4f}')
+                         f'mean RMSE={rmse.mean():.2e}  max RMSE={rmse.max():.2e}')
             fig.tight_layout()
             path = os.path.join(self.config.image_dir, f'function_approx_{tag}_epoch{self.epoch:03d}.png')
             fig.savefig(path, bbox_inches='tight')
@@ -240,11 +255,13 @@ class TimeMultiplexedNFATrainer:
             'epoch'    : self.epoch,
             'config'   : config_to_dict(self.config),
             'model'    : self.model.state_dict(),
-            'criterion': self.criterion.state_dict(),   # includes running Pmin/Pmax buffers
+            'criterion': self.criterion.state_dict(),   # includes the learned scale/bias readout
             'opt_slm'  : self.opt_slm.state_dict()   if self.opt_slm   else None,
             'sched_slm': self.sched_slm.state_dict() if self.sched_slm else None,
             'opt_layers'  : self.opt_layers.state_dict(),
             'sched_layers': self.sched_layers.state_dict(),
+            'opt_readout'  : self.opt_readout.state_dict(),
+            'sched_readout': self.sched_readout.state_dict(),
         }
 
     def save(self, max_keep=5):
@@ -301,6 +318,18 @@ class TimeMultiplexedNFATrainer:
                 self.sched_layers.load_state_dict(ckpt['sched_layers'])
             except (ValueError, RuntimeError) as e:
                 print(f'  [warning] sched_layers state skipped: {e}')
+
+        if ckpt.get('opt_readout') is not None:
+            try:
+                self.opt_readout.load_state_dict(ckpt['opt_readout'])
+            except (ValueError, RuntimeError) as e:
+                print(f'  [warning] opt_readout state skipped: {e}')
+
+        if ckpt.get('sched_readout') is not None:
+            try:
+                self.sched_readout.load_state_dict(ckpt['sched_readout'])
+            except (ValueError, RuntimeError) as e:
+                print(f'  [warning] sched_readout state skipped: {e}')
 
         self.epoch = ckpt['epoch']
         print(f'  Resumed from epoch {self.epoch}')
@@ -429,6 +458,7 @@ def main():
         if trainer.sched_slm is not None:
             trainer.sched_slm.step()
         trainer.sched_layers.step()
+        trainer.sched_readout.step()
 
         writer.add_scalar('loss/train',        run_loss,        epoch)
         writer.add_scalar('key_gnorm/train',   run_slm_gnorm,   epoch)

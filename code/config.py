@@ -120,7 +120,7 @@ def init_params():
     tc.wavelength = 550 * nm 
     tc.ridx_air   = 1.0
 
-    tc.pixel_pitch = 0.55 * tc.wavelength  # PAPER (Sec. 2.2): "lateral pitch
+    tc.pixel_pitch = 300 * nm               # PAPER (Sec. 2.2): "lateral pitch
                                             # delta of 300nm (~0.55*lambda)".
                                             # Shared pitch for input pixels,
                                             # output pixels, AND diffractive-
@@ -141,6 +141,7 @@ def init_params():
     tc.sim_dx = tc.pixel_pitch
     tc.N_sim  = 256
     tc.asm_pad_factor = 1
+    tc.r = 1.25 # scaling factor of the diffractive layer's feature count relative to the paper's 2*Np*Nf guideline
 
     # ------------------------------------------------------------------ #
     #  Nonlinear function approximation -- targets & input encoding       #
@@ -172,7 +173,7 @@ def init_params():
     #  not paper-derived.                                                 #
     # ------------------------------------------------------------------ #
     tc.slm_dx      = tc.pixel_pitch  
-    tc.slm_x_num   = int(np.ceil(np.sqrt(1.25 * 2 * tc.Np * tc.Nf / 2)))
+    tc.slm_x_num   = int(np.ceil(np.sqrt(tc.r * 2 * tc.Np * tc.Nf / 2)))
     tc.slm_bin     = int(tc.slm_dx / tc.sim_dx)
     tc.slm_x_num_sim = tc.slm_x_num * tc.slm_bin
 
@@ -209,7 +210,7 @@ def init_params():
     #  (unchanged role/mechanism from before).                             #
     #  PAPER (Sec. 2.2): K=2 surfaces (their main/default design; K=4 is a #
     #  deeper alternative shown to further reduce error, Fig. 3/4), with   #
-    #  N ~= 1.25 * 2*Np*Nf trainable features total, distributed evenly    #
+    #  N ~= r * 2*Np*Nf trainable features total, distributed evenly    #
     #  over the K surfaces -- this sets layer_size (features per side of   #
     #  a square layer) below. This is a GUIDELINE, not a strict requirement#
     #  (paper's own wording) -- computed here as a starting default, but   #
@@ -219,7 +220,7 @@ def init_params():
     # ------------------------------------------------------------------ #
     tc.num_layers    = 2   # PAPER (Sec. 2.2): K
     tc.layer_dx      = tc.pixel_pitch  # PAPER: diffractive feature width == delta
-    tc.layer_size    = int(np.ceil(np.sqrt(1.25 * 2 * tc.Np * tc.Nf / tc.num_layers)))
+    tc.layer_size    = int(np.ceil(np.sqrt(tc.r * 2 * tc.Np * tc.Nf / tc.num_layers)))
     tc.layer_bin      = int(tc.layer_dx / tc.sim_dx)
     tc.layer_size_sim = tc.layer_size * tc.layer_bin
 
@@ -259,11 +260,18 @@ def init_params():
     tc.pd_num_cols = 10
     tc.num_photodiodes = tc.pd_num_rows * tc.pd_num_cols
 
-    # PAPER (Sec. 2.2): "an inter-pixel spacing of ~0.5*lambda is included"
-    # between neighboring output pixels (to suppress cross-talk) -- so
-    # center-to-center spacing = detector width (delta) + that 0.5*lambda gap.
-    tc.pd_row_spacing = tc.photodiode_size + 0.5 * tc.wavelength  # center-to-center spacing, row direction
-    tc.pd_col_spacing = tc.photodiode_size + 0.5 * tc.wavelength  # center-to-center spacing, column direction
+    # NOTE: deviates from PAPER here. The paper specifies an inter-pixel gap of
+    # ~0.5*lambda (Sec. 2.2), i.e. center-to-center spacing = photodiode_size +
+    # 0.5*wavelength -- but at this project's sim_dx == pixel_pitch (300nm),
+    # that spacing (575nm = 1.917 sim-grid pixels) gets truncated by
+    # int(pd_row_spacing / sim_dx) down to 1 pixel -- i.e. the SAME as
+    # photodiode_pixels, so the detectors end up simulated as touching with NO
+    # gap at all (crosstalk risk), silently defeating the paper's own
+    # crosstalk-suppression intent. Using spacing = 2*photodiode_size instead
+    # guarantees a whole extra sim-grid pixel of real gap between detectors
+    # (spacing_px=2, photodiode_pixels=1) regardless of sim_dx.
+    tc.pd_row_spacing = 4 * tc.photodiode_size  # center-to-center spacing, row direction
+    tc.pd_col_spacing = 4 * tc.photodiode_size  # center-to-center spacing, column direction
     tc.pd_row_spacing_px = int(tc.pd_row_spacing / tc.sim_dx)
     tc.pd_col_spacing_px = int(tc.pd_col_spacing / tc.sim_dx)
 
@@ -290,16 +298,16 @@ def init_params():
     #  intensity-domain summing are added on top, so these are our own    #
     #  choices, carried over from the old train_samples/val_samples scale. #
     # ------------------------------------------------------------------ #
-    tc.train_a_samples = 20000  # NOTE: not defined in paper -- fixed pool size
-    tc.val_a_grid_size  = 1000   # NOTE: not defined in paper -- dense eval grid
-    tc.test_a_grid_size = 1000   # NOTE: not defined in paper -- dense eval grid
+    tc.train_a_samples = 10000  
+    tc.val_a_grid_size  = 1000   
+    tc.test_a_grid_size = 1000  
 
     # ------------------------------------------------------------------ #
     #  Training hyper-parameters                                          #
     # ------------------------------------------------------------------ #
-    tc.batch_size       = 12
+    tc.batch_size       = 64
     tc.test_batch_size  = 4
-    tc.max_epoch        = 100
+    tc.max_epoch        = 150
     tc.seed             = 59
 
     tc.num_workers = 0
@@ -316,15 +324,11 @@ def init_params():
                                           #
     # ------------------------------------------------------------------ #
     tc.loss_type = 'mse'      # NOTE: not defined in paper -- superseded loss_mode
-    tc.norm_momentum = 0.1    # NOTE: not defined in paper -- running Pmin/Pmax
-                              # update rate (analogous to BatchNorm momentum)
-                              # for the online version of the paper's Eq. 9
-                              # min-max normalization.
 
     # ------------------------------------------------------------------ #
-    #  Logging & checkpoints  (written to conv_decoder/logs/)             #
+    #  Logging & checkpoints        #
     # ------------------------------------------------------------------ #
-    tc.checkpoint_save  = 3
+    tc.checkpoint_save  = 10
     tc.checkpoint_print = 1
 
     tc.run_name = _build_run_name(tc)
