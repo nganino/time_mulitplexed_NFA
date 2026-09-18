@@ -124,11 +124,12 @@ Current defaults (paper-scale regime, adopted 2026-09-17):
 | phase key | `M` | 1 | our addition, not paper-derived; **the whole point of this project is to sweep this** |
 | layers | `num_layers` (K) | 2 | PAPER's default/main design (K=4 is their deeper alt.) |
 | layers | `layer_size` | `ceil(sqrt(1.25*2*Np*Nf/K))` = 34 | PAPER's guideline `N ~= 1.25*2*Np*Nf` total features -- computed ONCE as a starting default in `init_params()`, NOT re-derived in `recompute_derived()`, so `--set layer_size=X` sticks |
-| spacings | `key_to_enc_spacing`, `slm_first_layer_spacing`, `interlayer_spacing`, `last_layer_ccd_spacing` | all == `z = W*sqrt((2*pixel_pitch/wavelength)^2 - 1)` ~= 4.71 um, `W = layer_size*layer_dx` | PAPER uses ONE uniform value for every plane-to-plane gap (Sec. 2.2); we apply the same value to the key->encoding gap too even though it has no paper analogue |
+| phase key | `slm_x_num` | `= layer_size` (34 by default) | own choice (2026-09-18): each phase key sized to match ONE diffractive layer, so total learnable phases = `K*layer_size^2 + M*layer_size^2` = `r*2*Np*Nf*(1+M/K)` -- also a ONE-TIME init value, does NOT auto-track a later `--set layer_size=X` |
+| spacings | `key_to_enc_spacing`, `slm_first_layer_spacing`, `interlayer_spacing`, `last_layer_ccd_spacing` | all == `z = W*sqrt((2*pixel_pitch/wavelength)^2 - 1)` ~= 4.45 um, `W = layer_size*layer_dx` | PAPER uses ONE uniform value for every plane-to-plane gap (Sec. 2.2); we apply the same value to the key->encoding gap too even though it has no paper analogue. Also a ONE-TIME init value tied to `layer_size` -- changing `layer_size` via `--set` does NOT recompute these |
 | detector | `pd_num_rows`, `pd_num_cols` | 10, 10 (== Nf) | must satisfy `rows*cols == Nf`, asserted |
 | detector | `photodiode_size` | `= pixel_pitch` | PAPER: detector width == delta |
-| detector | `pd_row/col_spacing` | `photodiode_size + 0.5*wavelength` | PAPER: "inter-pixel spacing of ~0.5*lambda" |
-| sampling | `train_a_samples` | 20000 | fixed pool, resampled/reshuffled each epoch (NOT regenerated -- drawn once, seeded by `config.seed`) |
+| detector | `pd_row/col_spacing` | `4 * photodiode_size` | **Deviates from PAPER's `photodiode_size + 0.5*wavelength`** -- that spacing (1.9 sim-grid pixels) got silently truncated by `int()` to 1 pixel (== photodiode_size itself), i.e. detectors simulated as touching with NO real gap, defeating the paper's own crosstalk-suppression intent. Fixed 2026-09-18 by tying spacing to a whole multiple of `photodiode_size` instead -- see "Known open items" below for the crosstalk-sweep finding that motivated this |
+| sampling | `train_a_samples` | 10000 | fixed pool, resampled/reshuffled each epoch (NOT regenerated -- drawn once, seeded by `config.seed`) |
 | sampling | `val_a_grid_size`, `test_a_grid_size` | 1000, 1000 | dense EVENLY-SPACED grids (not random) -- approximates the paper's continuous RMSE integral (Eq. 16) with low variance and gives gap-free plots |
 | loss | `loss_type` | `'mse'` | only `'mse'` is implemented |
 | loss | `norm_momentum` | 0.1 | **OBSOLETE** -- was the EMA rate for the old running Pmin/Pmax buffers; `loss.py` now uses a learned scale/bias instead (see "Known open items") |
@@ -352,6 +353,47 @@ per_function_rmse(f_hat, target)   [Nf]
   reported ~1e-7 RMSE for Nf=100. See `code/logs/SWEEP_HANDOVER.txt` for the
   fuller experiment log and suggested next directions (deviating from the
   paper's spacing defaults, then sweeping `M`).
+- ~~Detector crosstalk~~ **FOUND & FIXED (2026-09-18) -- the single biggest
+  result of this project so far.** The paper's own inter-detector gap
+  (`photodiode_size + 0.5*wavelength` = 1.9 sim-grid pixels) gets truncated by
+  `int(pd_row_spacing / sim_dx)` down to 1 pixel -- exactly `photodiode_pixels`
+  itself -- meaning every experiment up to this point (both LR sweeps, the
+  `train_a_samples` sweep, the `key_to_enc_spacing` sweep) had detectors
+  simulated as touching, with ZERO real gap, silently defeating the paper's
+  own crosstalk-suppression design and putting a hard accuracy CEILING on
+  everything measured against that geometry.
+
+  **Fix:** `pd_row/col_spacing` changed to a whole multiple of
+  `photodiode_size` (guarantees an integer-pixel gap regardless of `sim_dx`,
+  see config.py's table row above) -- current default is `4*photodiode_size`
+  (3 pixels of real gap). A dedicated sweep (M=1, 20k samples,
+  `logs/pdspacing_sweep_M1/`, plot `pdspacing_sweep_M1_rmse.png`) scanning
+  2/3/4/5 pixels of center-to-center spacing found a hard cliff: 2px (1 pixel
+  gap) gives rmse_mean=0.0064 (in line with every prior "normal" result in
+  this file), but 3px (2 pixel gap) collapses to rmse_mean=1e-6, 4px to
+  effectively 0/1e-6 -- matching the PAPER'S OWN reported ~1e-7 precision, at
+  plain M=1 with nothing else changed. Verified genuine (not a degenerate
+  collapse) by inspecting the actual target-vs-approx curves -- distinct,
+  complex, wiggly target functions fit essentially exactly -- and the
+  training log, which shows ordinary smooth SGD convergence over 150 epochs,
+  not a discontinuous jump.
+
+  **Why this matters for everything above:** every sweep result recorded
+  earlier in this section (train_a_samples, key_to_enc_spacing, both LR
+  sweeps) was measured against a crosstalk-limited accuracy ceiling, not
+  against those parameters' own true effect -- e.g. `train_a_samples`'s
+  "mostly exhausted, ~4 orders of magnitude off the paper" conclusion no
+  longer holds once crosstalk is fixed; that gap was crosstalk, not sample
+  count. Those sweeps are worth re-running at a crosstalk-free spacing before
+  trusting their conclusions.
+
+  **Implication for the M-sweep (this project's actual point):** at a
+  crosstalk-free spacing, M=1 alone may already be near the achievable floor,
+  leaving little residual error for the M-key "wisdom of the crowd" averaging
+  to visibly reduce -- see `code/logs/SWEEP_HANDOVER.txt` and the in-progress
+  `logs/M_sweep_pd2px/` (Np=9) and `logs/M_sweep_pd2px_Np25/` (Np=25) sweeps,
+  both run at a smaller, non-machine-precision 2px spacing specifically so
+  there's real residual error left to observe an M effect on.
 - **GPU utilization / `batch_size`**: the config default `batch_size=12` only
   reaches ~36-39% utilization on an RTX 4090 for this model size (kernel-launch
   overhead dominates at such a small batch) -- `batch_size=64` was found to
@@ -359,18 +401,41 @@ per_function_rmse(f_hat, target)   [Nf]
   batch size used for sweeps in this repo, though `config.py`'s own default is
   left at 12 (not changed without being asked). Worth re-benchmarking batch
   size again if the model's shape (`Np`/`Nf`/`layer_size`/`M`) changes a lot.
-- **`layer_size`/`slm_x_num` are computed once from the paper's guideline
-  formula and NOT re-derived in `recompute_derived()`** -- if you `--set Np=...`
-  or `--set Nf=...`, you must manually recompute/re-set `layer_size` and
-  `slm_x_num` yourself; they will NOT automatically track the new Np/Nf.
+- **`layer_size`/`slm_x_num` are computed once (`init_params()`) and NOT
+  re-derived in `recompute_derived()`** -- if you `--set Np=...` or
+  `--set Nf=...`, you must manually recompute/re-set both yourself; they will
+  NOT automatically track the new Np/Nf. As of 2026-09-18, `slm_x_num` is
+  literally set to `tc.layer_size` (each phase key is deliberately sized to
+  match one diffractive layer, so total learnable phases work out to
+  `K*layer_size^2 + M*layer_size^2` = `r*2*Np*Nf * (1 + M/K)`) -- so a
+  `--set layer_size=X` alone is enough to keep them matched AT DEFAULT time,
+  but this is still a one-time init value: overriding `layer_size` via
+  `--set` after the fact does NOT retroactively update `slm_x_num`, so you
+  must still pass both explicitly together (e.g.
+  `--set Np=25 layer_size=56 slm_x_num=56 ...`, see `logs/M_sweep_pd2px_Np25/`
+  for a worked example, which also had to recompute the paper-tied spacings
+  for the new layer_size).
 - **Diffraction-efficiency loss penalty (paper Eq. 13/14, `LDE`) was
   deliberately NOT implemented** -- explicit decision to keep the first version
   to plain MSE only; revisit once the core M-key accuracy idea is validated.
-- **`M` default is 1** (no ensembling) -- sweeping M upward is the actual point
-  of this project and hasn't been systematically explored yet (all sweeps so
-  far, incl. the ones above, are still M=1 groundwork); `phase_key_similarity.png`
-  (test.py) is the primary diagnostic for whether increasing M is actually
-  buying diversity or just redundant keys.
+- **`M` default is 1** (no ensembling). First M sweeps (2026-09-18, M in
+  {1,2,3,5,8}, `pd_row/col_spacing=2*photodiode_size` so there's real
+  residual error at M=1 to average down -- a fully crosstalk-free spacing
+  gets too close to machine precision at M=1 already, see the crosstalk
+  bullet above) found a striking, Np-dependent split: at Np=9
+  (`logs/M_sweep_pd2px/`) M gave a >3000x rmse_mean reduction (0.0064 ->
+  2.3e-6); at Np=25 (`logs/M_sweep_pd2px_Np25/`, needed `layer_size`/
+  `slm_x_num`=56 and the four spacings recomputed, see below) M gave <2x
+  (0.0097 -> 0.0053). Comparison plot: `logs/M_sweep_Np9_vs_Np25_rmse.png`.
+  Leading hypothesis: Np=25 may be capacity-limited (layer_size only grew
+  34->56 while Np grew 9->25) rather than crosstalk/redundancy-limited --
+  M-averaging cancels independent per-key noise, not a systematic capacity
+  shortfall shared by every key through the same diffractive layers. Not
+  yet confirmed -- see `code/logs/SWEEP_HANDOVER.txt` for the suggested
+  next experiment (more capacity at Np=25, check if the M-effect returns).
+  `phase_key_similarity.png` (test.py) -- whether increasing M is actually
+  buying diversity or just redundant keys -- hasn't been systematically
+  checked across these sweeps yet either.
 - **`key_to_enc_spacing` sweep (2026-09-18, complete, M=1, 20k samples,
   `logs/keyspacing_sweep_M1/`)**: deliberately deviating from the paper's
   uniform-spacing choice for just this one gap (phase-key -> encoding plane,

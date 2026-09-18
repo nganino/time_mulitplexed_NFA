@@ -112,9 +112,14 @@ def _print_summary(agg, tag='Test'):
 
 def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
     '''
-    Combined test-summary figure -- one PNG instead of three separate files:
-      - top-left:  histogram of per-function RMSE (paper Fig. 2a-style)
-      - top-right: spatial map of per-function RMSE over the detector plane
+    Combined test-summary figure -- one PNG instead of separate files:
+      - top-left:   histogram of per-function RMSE (paper Fig. 2a-style)
+      - top-middle: RMSE vs. each function's target dynamic range (max-min
+        over the domain) -- a simple difficulty/complexity proxy, testing
+        whether more-oscillatory/higher-range functions are the ones fit
+        worst. The same best/middle/worst functions highlighted in the
+        bottom row are marked here too, tying the two panels together.
+      - top-right:  spatial map of per-function RMSE over the detector plane
       - bottom row (full width): target-vs-approx curves for representative
         functions -- best-fit, worst-fit, and two spread across the middle
         of the error distribution (paper Fig. 2b/2c-style)
@@ -129,18 +134,57 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
     rmse_np = rmse.numpy()
     Nf = rmse.shape[0]
 
+    # Rank-based labels come from the ERROR-sorted position (index 0 = best
+    # fit, Nf-1 = worst fit). `label_of` is built in best->worst order and
+    # (relying on dict insertion order) `show_idx` below is left as-is rather
+    # than re-sorted by function id `k`, so the bottom row displays left to
+    # right as best -> middle -> middle -> worst.
+    order_by_err = torch.argsort(rmse)
+    rank_positions = [0, Nf // 3, 2 * Nf // 3, Nf - 1]
+    rank_labels    = ['best', 'middle', 'middle', 'worst']
+    label_of = {}
+    for pos, lab in zip(rank_positions, rank_labels):
+        k = int(order_by_err[pos])
+        label_of.setdefault(k, lab)   # keep first label if Nf is small enough to collide
+    show_idx = list(label_of.keys())[:n_show]
+
+    # ncols = 3*n_show divides evenly by n_show (bottom row's equal columns);
+    # the top row instead splits unevenly -- histogram gets back close to the
+    # ~half-width it had before this panel existed, the complexity scatter
+    # (simple, doesn't need much width) gets the least, heatmap gets the rest
+    # (it needs room for its colorbar without feeling squeezed).
+    ncols = 3 * n_show
+    hist_w = ncols * 5 // 12
+    cx_w   = ncols * 3 // 12
+    heat_w = ncols - hist_w - cx_w
     fig = plt.figure(figsize=(4 * n_show, 7.2), dpi=dpi)
-    gs = fig.add_gridspec(2, n_show, height_ratios=[1.15, 1])
-    half = n_show // 2   # top row splits n_show columns into left/right halves
+    gs = fig.add_gridspec(2, ncols, height_ratios=[1.15, 1])
 
     # ---- top-left: error distribution histogram ----------------------------
-    ax_hist = fig.add_subplot(gs[0, :half])
+    ax_hist = fig.add_subplot(gs[0, :hist_w])
     ax_hist.hist(rmse_np, bins=min(30, max(len(rmse_np), 1)), color='steelblue', alpha=0.85)
     ax_hist.axvline(rmse_np.mean(), color='crimson', linestyle='--',
                      label=f'mean={rmse_np.mean():.2e}')
     ax_hist.set_xlabel('RMSE'); ax_hist.set_ylabel('# functions')
     ax_hist.set_title(f'Error distribution (Nf={len(rmse_np)})', fontsize=10)
     ax_hist.legend(fontsize=8)
+
+    # ---- top-middle: RMSE vs. target dynamic range (difficulty proxy) -------
+    ax_cx = fig.add_subplot(gs[0, hist_w:hist_w + cx_w])
+    target_range = target.max(axis=0) - target.min(axis=0)   # [Nf], each in [0,1]
+    ax_cx.scatter(target_range, rmse_np, s=14, alpha=0.5, color='steelblue', label='_nolegend_')
+    _rank_colors = {'best': 'tab:green', 'middle': 'tab:orange', 'worst': 'tab:red'}
+    _seen_labels = set()
+    for k, lab in label_of.items():
+        ax_cx.scatter(target_range[k], rmse_np[k], s=45, marker='*',
+                       color=_rank_colors[lab], edgecolors='black', linewidths=0.5,
+                       label=(lab if lab not in _seen_labels else '_nolegend_'))
+        _seen_labels.add(lab)
+    ax_cx.set_yscale('log')
+    ax_cx.set_xlabel('target dynamic range (max - min over a)')
+    ax_cx.set_ylabel('RMSE')
+    ax_cx.set_title('Error vs. target complexity', fontsize=10)
+    ax_cx.legend(fontsize=7)
 
     # ---- top-right: spatial error heatmap -----------------------------------
     # Detector (r, c) reads function k = r*pd_num_cols + c (matches model.py's
@@ -152,15 +196,25 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
     # physical measurement), and the true detector footprints are drawn to
     # scale (actual photodiode_size, not a cosmetic marker) so the real fill
     # factor is visible.
-    ax_heat = fig.add_subplot(gs[0, half:])
+    ax_heat = fig.add_subplot(gs[0, hist_w + cx_w:])
     rows, cols = config.pd_num_rows, config.pd_num_cols
     grid = rmse_np.reshape(rows, cols)   # row-major k = r*cols + c, matches model.py
 
     height_um = (rows - 1) * config.pd_row_spacing * 1e6
     width_um  = (cols - 1) * config.pd_col_spacing * 1e6
-    extent    = [-width_um / 2, width_um / 2, -height_um / 2, height_um / 2]
+    row_step_um = config.pd_row_spacing * 1e6
+    col_step_um = config.pd_col_spacing * 1e6
 
-    im = ax_heat.imshow(grid, cmap='hot', origin='lower', extent=extent,
+    # Edge-pad the grid by one step on every side (nearest-value extrapolation)
+    # and grow imshow's own extent to match, so the margin around the true
+    # detector array is real (if extrapolated) heatmap color, not blank axes
+    # background -- then only show a slice of that padded margin (via
+    # xlim/ylim below), just enough to clear the edge detectors' squares.
+    grid_padded = np.pad(grid, pad_width=1, mode='edge')
+    extent = [-width_um / 2 - col_step_um, width_um / 2 + col_step_um,
+              -height_um / 2 - row_step_um, height_um / 2 + row_step_um]
+
+    im = ax_heat.imshow(grid_padded, cmap='hot', origin='lower', extent=extent,
                          interpolation='bilinear')
     ys = np.linspace(-height_um / 2, height_um / 2, rows)
     xs = np.linspace(-width_um / 2, width_um / 2, cols)
@@ -170,9 +224,16 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
             ax_heat.add_patch(Rectangle(
                 (xx - pd_w_um / 2, yy - pd_w_um / 2), pd_w_um, pd_w_um,
                 facecolor='none', edgecolor='white', linewidth=0.7, alpha=0.85))
+    # Clip the view to just past the outermost detectors' squares (which
+    # extend photodiode_size/2 beyond the last detector CENTER) -- comfortably
+    # inside the one-full-step padded region above, so this margin is always
+    # real (extrapolated) heatmap color, never blank.
+    margin_um = pd_w_um
+    ax_heat.set_xlim(-width_um / 2 - margin_um, width_um / 2 + margin_um)
+    ax_heat.set_ylim(-height_um / 2 - margin_um, height_um / 2 + margin_um)
     ax_heat.set_xlabel('detector-plane x (µm)')
     ax_heat.set_ylabel('detector-plane y (µm)')
-    ax_heat.set_title('Spatial RMSE map (interpolated between detectors)', fontsize=10)
+    ax_heat.set_title('Spatial RMSE map', fontsize=10)
     cbar = fig.colorbar(im, ax=ax_heat, fraction=0.046, pad=0.04)
     cbar.set_label('RMSE')
     # Format each tick as its own scientific-notation value rather than a
@@ -183,21 +244,8 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
     cbar.update_ticks()
 
     # ---- bottom row: target-vs-approx curves --------------------------------
-    # Rank-based labels come from the ERROR-sorted position (index 0 = best
-    # fit, Nf-1 = worst fit) -- assigned here, before `show_idx` gets re-sorted
-    # by function id `k` for left-to-right display order, so the label always
-    # reflects true error rank regardless of display order.
-    order_by_err = torch.argsort(rmse)
-    rank_positions = [0, Nf // 3, 2 * Nf // 3, Nf - 1]
-    rank_labels    = ['best', 'middle', 'middle', 'worst']
-    label_of = {}
-    for pos, lab in zip(rank_positions, rank_labels):
-        k = int(order_by_err[pos])
-        label_of.setdefault(k, lab)   # keep first label if Nf is small enough to collide
-    show_idx = sorted(label_of.keys())[:n_show]
-
     for i, k in enumerate(show_idx):
-        ax = fig.add_subplot(gs[1, i])
+        ax = fig.add_subplot(gs[1, i * 3:(i + 1) * 3])
         ax.plot(a, target[:, k], '--', color='tab:green', label='target')
         ax.plot(a, f_hat[:, k], '-.', color='tab:red', label='approx')
         ax.set_title(f'f_{k}  (RMSE={rmse[k]:.2e}) [{label_of[k]}]', fontsize=9)
@@ -205,8 +253,7 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
         if i == 0:
             ax.legend(fontsize=7)
 
-    fig.suptitle(f'Test summary   mean RMSE={rmse.mean():.2e}   max RMSE={rmse.max():.2e}',
-                 fontsize=12)
+    fig.suptitle(f'Test summary   mean RMSE={rmse.mean():.2e}   max RMSE={rmse.max():.2e}\nr={config.r}  Np={config.Np}  Nf={config.Nf}  M={config.M}  K={config.num_layers}', fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(save_path, bbox_inches='tight')
     plt.close(fig)
@@ -343,49 +390,65 @@ def _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse):
     print(f'Results appended → {csv_path}')
 
 
-def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_label=None):
+def _load_and_evaluate(ckpt_path):
+    '''
+    Load a checkpoint (config + model + criterion) and run one eval pass over
+    its own dense test grid. Returns (agg, config, model, device) -- the raw
+    building block shared by evaluate() and cross-run comparison scripts
+    (e.g. plot_sweep_grid.py). Callers get rmse (and a printed summary) via
+    _print_summary(agg).
+    '''
     config = init_params()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # ── Load checkpoint (config first, then model) ────────────────────────
     # Preserve local paths -- machine-specific, must not be overwritten by
     # whatever was saved inside the checkpoint.
     _path_keys = ('log_dir', 'image_dir', 'model_dir', 'tfboard_dir')
     saved_paths = {k: getattr(config, k, None) for k in _path_keys}
 
-    ckpt_path = ckpt_path or config.ckpt_to_load
-    ckpt = None
-    if ckpt_path is not None:
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if 'config' in ckpt:
-            config.__dict__.update(ckpt['config'])
-            for k, v in saved_paths.items():
-                if v is not None:
-                    setattr(config, k, v)
-            recompute_derived(config)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if 'config' in ckpt:
+        config.__dict__.update(ckpt['config'])
+        for k, v in saved_paths.items():
+            if v is not None:
+                setattr(config, k, v)
+        recompute_derived(config)
 
     model     = TimeMultiplexedNFA(config).to(device)
     criterion = FunctionApproxLoss(config).to(device)
-    if ckpt is not None:
-        model.load_state_dict(ckpt['model'], strict=False)
-        if ckpt.get('criterion') is not None:
-            criterion.load_state_dict(ckpt['criterion'], strict=False)
-        print(f'Loaded: {ckpt_path}  (epoch {ckpt["epoch"]})')
+    model.load_state_dict(ckpt['model'], strict=False)
+    if ckpt.get('criterion') is not None:
+        criterion.load_state_dict(ckpt['criterion'], strict=False)
+    print(f'Loaded: {ckpt_path}  (epoch {ckpt["epoch"]})')
+    model.eval(); criterion.eval()
+
+    _, _, test_loader, target_fn = get_function_approx_dataloaders(config)
+    agg = _eval_loop(model, test_loader, criterion, device, desc='Testing')
+    return agg, config, model, device
+
+
+def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_label=None):
+    ckpt_path = ckpt_path or init_params().ckpt_to_load
+
+    if ckpt_path is not None:
+        agg, config, model, device = _load_and_evaluate(ckpt_path)
     else:
         print('[WARNING] No checkpoint provided — evaluating random init.')
-    model.eval(); criterion.eval()
+        config = init_params()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model     = TimeMultiplexedNFA(config).to(device)
+        criterion = FunctionApproxLoss(config).to(device)
+        model.eval(); criterion.eval()
+        _, _, test_loader, target_fn = get_function_approx_dataloaders(config)
+        agg = _eval_loop(model, test_loader, criterion, device, desc='Testing')
+
+    rmse = _print_summary(agg)
 
     if out_dir is None:
         out_dir = os.path.join(
             os.path.dirname(ckpt_path) if ckpt_path else '.', '..', 'test'
         )
     os.makedirs(out_dir, exist_ok=True)
-
-    # ── Test loader: dense a-grid, deterministic from config's Np/Nf/func_seed ──
-    _, _, test_loader, target_fn = get_function_approx_dataloaders(config)
-
-    agg  = _eval_loop(model, test_loader, criterion, device, desc='Testing')
-    rmse = _print_summary(agg)
 
     if csv_path is not None:
         _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse)

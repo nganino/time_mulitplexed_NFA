@@ -57,6 +57,7 @@ class TimeMultiplexedNFA(nn.Module):
         self.encoding_side      = config.encoding_side
         self.encoding_x_num_sim = config.encoding_x_num_sim
         self.encoding_freq_step = float(getattr(config, 'encoding_freq_step', 1))
+        self.encoding_opaque_background = bool(getattr(config, 'encoding_opaque_background', False))
 
         # Photodiode array (pd_num_rows x pd_num_cols detectors, replacing the single
         # photodiode). The array is centered on (N_sim/2 + detector_offset_y/x): with
@@ -117,12 +118,24 @@ class TimeMultiplexedNFA(nn.Module):
         aperture[..., y0:y1, x0:x1] = 1.0
         self.register_buffer('slm_aperture', aperture)
 
-        # Layer aperture 
+        # Layer aperture
         layer_ap = torch.zeros(1, 1, self.N_sim, self.N_sim)
         ly0 = (self.N_sim - self.layer_size_sim) // 2
         ly1 = ly0 + self.layer_size_sim
         layer_ap[..., ly0:ly1, ly0:ly1] = 1.0   # square aperture, same centering both axes
         self.register_buffer('layer_aperture', layer_ap)
+
+        # Function-input encoding-plane aperture: transparent everywhere by
+        # default (amplitude 1, config.encoding_opaque_background=False --
+        # today's behavior), or opaque outside the Np-pixel patch (amplitude 0,
+        # same centering _embed_in_sim uses for phi_in_sim) when True.
+        enc_ap = torch.ones(1, 1, self.N_sim, self.N_sim)
+        if self.encoding_opaque_background:
+            enc_ap.zero_()
+            ey0 = (self.N_sim - self.encoding_x_num_sim) // 2
+            ey1 = ey0 + self.encoding_x_num_sim
+            enc_ap[..., ey0:ey1, ey0:ey1] = 1.0
+        self.register_buffer('encoding_aperture', enc_ap)
 
         # Free-space propagators (key -> encoding plane, then through the
         # diffractive layers to the detector -- no no-layers bypass anymore)
@@ -248,7 +261,8 @@ class TimeMultiplexedNFA(nn.Module):
         U_at_enc     = self.prop_key_to_enc(U_slm) # [T, 1, N_sim, N_sim]
         U_at_enc_exp = U_at_enc[:, 0, :, :].unsqueeze(0) # [1, T, N_sim, N_sim]
 
-        U_in_exp = torch.exp(1j * phi_in_sim).expand(-1, self.T, -1, -1) # [B, T, N_sim, N_sim]
+        U_in = self.encoding_aperture * torch.exp(1j * phi_in_sim)  # [B, 1, N_sim, N_sim]
+        U_in_exp = U_in.expand(-1, self.T, -1, -1) # [B, T, N_sim, N_sim]
         U_flat = (U_at_enc_exp * U_in_exp).reshape(B * self.T, 1, self.N_sim, self.N_sim)
 
         field = self.prop_to_layer1(U_flat)

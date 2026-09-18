@@ -75,7 +75,7 @@ def plot_sweep(csv_path, xlabel, out_path=None, title=None, dpi=150):
     ax.plot(x, max_rmse, 's-', label='max RMSE (over Nf functions)')
     ax.plot([], [], ' ', label=tag)   # text-only legend entry, not a data series
     ax.set_xlabel(xlabel)
-    ax.set_ylabel('RMSE')
+    ax.set_ylabel('Average Test RMSE')
     ax.set_yscale('log')
     # When every swept value is a whole number (spacing multipliers, M, ...),
     # pin ticks to just those values -- matplotlib's default locator would

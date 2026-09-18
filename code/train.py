@@ -469,7 +469,7 @@ def main():
             print_and_save_msg(msg, log_file)
 
         if epoch % config.checkpoint_save == 0:
-            val_loss, rmse = trainer.evaluate(val_loader, tag='val')
+            val_loss, rmse = trainer.evaluate(val_loader, tag='val', plot=False)
 
             writer.add_scalar('loss/val',      val_loss,           epoch)
             writer.add_scalar('rmse/val_mean', rmse.mean().item(), epoch)
@@ -480,8 +480,8 @@ def main():
             print_and_save_msg(msg, log_file)
 
             trainer.save()
-            trainer.save_phase_keys()
-            trainer.save_layer_masks()
+            #trainer.save_phase_keys()
+            #trainer.save_layer_masks()
 
             if val_loss < trainer.best_val_loss:
                 trainer.best_val_loss = val_loss

@@ -81,6 +81,10 @@ def recompute_derived(tc):
     # Encoding-plane geometry: Np input pixels arranged as a
     # sqrt(Np) x sqrt(Np) square patch (paper, Sec. 2.2: "arranged
     # contiguously in a square grid"), sharing the SLM's physical pixel pitch.
+    # Unlike layer_size/slm_x_num/the spacings, encoding_dx IS recomputed here
+    # (not just at init_params()) so `--set encoding_patch_scale=...` alone is
+    # enough -- no separate encoding_dx/encoding_bin override needed.
+    tc.encoding_dx        = tc.slm_dx * tc.encoding_patch_scale
     tc.encoding_bin       = int(tc.encoding_dx / tc.sim_dx)
     tc.encoding_side      = int(round(np.sqrt(tc.Np)))
     assert tc.encoding_side ** 2 == tc.Np, \
@@ -163,46 +167,28 @@ def init_params():
                                   # at 1 (Sec. 4.1: "alpha_p = p - 1"). Exposed
                                   # here in case we ever want to change it.
 
+    tc.encoding_opaque_background = False  # NOTE: not specified in paper --
+                                  # our own knob. False (default): everywhere
+                                  # OUTSIDE the Np-pixel encoding patch is fully
+                                  # transparent (amplitude 1, phase 0), i.e. the
+                                  # behavior this project has always had. True:
+                                  # that background is OPAQUE (amplitude 0), so
+                                  # only the Np-pixel patch itself transmits
+                                  # light. See model._encode_input /
+                                  # encoding_aperture.
+    tc.encoding_patch_scale = 1   # NOTE: not specified in paper -- our own
+                                  # knob. Sim-grid pixels spanned by EACH
+                                  # encoding phase value (alpha_p), independent
+                                  # of slm_bin/layer_bin. 1 (default): one
+                                  # phase value == one sim pixel (today's
+                                  # behavior). 2: each of the Np phase values
+                                  # fills a 2x2 block of sim pixels instead
+                                  # (nearest-neighbor upsample in
+                                  # model._encode_input, same mechanism
+                                  # slm_bin/layer_bin already use). Feeds into
+                                  # tc.encoding_dx below.
+
     tc.func_seed = 0              # random seed for generating Nf target functinons
-
-    # ------------------------------------------------------------------ #
-    #  Phase-key plane  (hardware device -- same SLM as before, new role) #
-    #  NOTE: the M-key / "wisdom of the crowd" time-multiplexing idea is  #
-    #  OUR OWN addition on top of the paper -- the paper has no phase-key #
-    #  plane or per-key ensembling concept, so M's role/value below is    #
-    #  not paper-derived.                                                 #
-    # ------------------------------------------------------------------ #
-    tc.slm_dx      = tc.pixel_pitch  
-    tc.slm_x_num   = int(np.ceil(np.sqrt(tc.r * 2 * tc.Np * tc.Nf / 2)))
-    tc.slm_bin     = int(tc.slm_dx / tc.sim_dx)
-    tc.slm_x_num_sim = tc.slm_x_num * tc.slm_bin
-
-    tc.slm_hw_x      = 1920  # NOTE: real-device pixel count, non-binding at
-    tc.slm_hw_y      = 1080  # this scale (bigger than N_sim -- gets clipped
-                              # to N_sim in model.py, i.e. no additional
-                              # aperture restriction beyond the sim window).
-    tc.slm_bit_depth = 8
-
-    tc.M               = 1  # NOTE: not defined in paper -- number of learned
-                             # phase keys (time-multiplexed conditioning masks).
-                             # Each key gives one independent estimate of f(a);
-                             # summing/averaging across keys before detection is
-                             # the "wisdom of the crowd" accuracy-improvement
-                             # mechanism this project adds.
-
-    tc.mask_init_method = 'normal'
-    tc.mask_init_std   = 0.5
-
-    # ------------------------------------------------------------------ #
-    #  Function-input encoding plane (deterministic, NOT learned)         #
-    #  Replaces the old "Object (MNIST phase images)" plane below --      #
-    #  instead of an image, this plane carries phi_in(p;a) = 2*pi *       #
-    #  encoding_freq_step * (p-1) * a for p = 1..Np (PAPER Sec. 2.2/4.1).  #
-    # ------------------------------------------------------------------ #
-    tc.encoding_dx        = tc.slm_dx  # == tc.pixel_pitch, PAPER (Sec. 2.2)
-    tc.encoding_bin       = int(tc.encoding_dx / tc.sim_dx)
-    tc.encoding_side      = int(round(np.sqrt(tc.Np)))
-    tc.encoding_x_num_sim = tc.encoding_side * tc.encoding_bin
 
     # ------------------------------------------------------------------ #
     #  Diffractive Layers                                                 #
@@ -217,12 +203,79 @@ def init_params():
     #  NOT re-derived in recompute_derived(), so you can freely --set      #
     #  layer_size to something else later without this formula clobbering #
     #  it back.                                                            #
+    #  NOTE: moved before the phase-key plane section below because the    #
+    #  phase-key size (slm_x_num) now reuses layer_size directly -- see    #
+    #  that section's comment.                                             #
+    #  N now also scales with tc.M (2026-09-18 correction) -- so tc.M must #
+    #  be assigned before this point too; see its own assignment below,    #
+    #  moved up here for exactly that reason (kept next to num_layers      #
+    #  rather than down in the Phase-key plane section where it's          #
+    #  conceptually grouped, since Python needs it defined before use).    #
     # ------------------------------------------------------------------ #
+    tc.M             = 1   # NOTE: not defined in paper -- number of learned
+                           # phase keys (time-multiplexed conditioning masks).
+                           # Each key gives one independent estimate of f(a);
+                           # summing/averaging across keys before detection is
+                           # the "wisdom of the crowd" accuracy-improvement
+                           # mechanism this project adds. Moved up from the
+                           # Phase-key plane section below -- see comment above.
     tc.num_layers    = 2   # PAPER (Sec. 2.2): K
+    tc.N_trainable_features = int(np.ceil(tc.r * 2 * tc.Np * tc.Nf * tc.M))
     tc.layer_dx      = tc.pixel_pitch  # PAPER: diffractive feature width == delta
-    tc.layer_size    = int(np.ceil(np.sqrt(tc.r * 2 * tc.Np * tc.Nf / tc.num_layers)))
+    tc.layer_size    = int(np.ceil(np.sqrt(tc.N_trainable_features / tc.num_layers)))
     tc.layer_bin      = int(tc.layer_dx / tc.sim_dx)
     tc.layer_size_sim = tc.layer_size * tc.layer_bin
+
+    # ------------------------------------------------------------------ #
+    #  Phase-key plane  (hardware device -- same SLM as before, new role) #
+    #  NOTE: the M-key / "wisdom of the crowd" time-multiplexing idea is  #
+    #  OUR OWN addition on top of the paper -- the paper has no phase-key #
+    #  plane or per-key ensembling concept, so M's role/value below is    #
+    #  not paper-derived.                                                 #
+    #                                                                      #
+    #  slm_x_num == layer_size (own choice, 2026-09-18): each phase key is #
+    #  sized to match exactly ONE diffractive layer. Since layer_size now  #
+    #  also scales with M (2026-09-18 correction, above), total learnable  #
+    #  phases across the whole system work out to                         #
+    #      K * layer_size^2   (the D2NN)          ~= r*2*Np*Nf*M           #
+    #    + M * layer_size^2   (the M phase keys)  ~= r*2*Np*Nf*M^2/K       #
+    #    = r*2*Np*Nf*M * (1 + M/K)  -- note this now grows FASTER than     #
+    #  linearly in M (M and M^2 terms), unlike the pre-correction formula  #
+    #  (which only had the M*layer_size^2 term scale with M).             #
+    #  Previously slm_x_num had its OWN formula (same N budget, but        #
+    #  divided by a hardcoded 2 instead of tc.num_layers, and without the  #
+    #  M factor) which only coincidentally matched layer_size while        #
+    #  num_layers==2 and M==1 -- seek git history if you ever need that    #
+    #  old, K/M-independent formula back.                                  #
+    # ------------------------------------------------------------------ #
+    tc.slm_dx      = tc.pixel_pitch
+    tc.slm_x_num   = tc.layer_size   # matches one diffractive layer's size -- see above
+    tc.slm_bin     = int(tc.slm_dx / tc.sim_dx)
+    tc.slm_x_num_sim = tc.slm_x_num * tc.slm_bin
+
+    tc.slm_hw_x      = 1920  # NOTE: real-device pixel count, non-binding at
+    tc.slm_hw_y      = 1080  # this scale (bigger than N_sim -- gets clipped
+                              # to N_sim in model.py, i.e. no additional
+                              # aperture restriction beyond the sim window).
+    tc.slm_bit_depth = 8
+
+    tc.mask_init_method = 'normal'
+    tc.mask_init_std   = 0.5
+
+    # ------------------------------------------------------------------ #
+    #  Function-input encoding plane (deterministic, NOT learned)         #
+    #  Replaces the old "Object (MNIST phase images)" plane below --      #
+    #  instead of an image, this plane carries phi_in(p;a) = 2*pi *       #
+    #  encoding_freq_step * (p-1) * a for p = 1..Np (PAPER Sec. 2.2/4.1).  #
+    # ------------------------------------------------------------------ #
+    tc.encoding_dx        = tc.slm_dx * tc.encoding_patch_scale  # == tc.pixel_pitch
+                                  # PAPER (Sec. 2.2) at the default patch_scale=1;
+                                  # patch_scale > 1 widens each encoding phase
+                                  # pixel beyond the paper's 1:1 pitch -- see
+                                  # tc.encoding_patch_scale above.
+    tc.encoding_bin       = int(tc.encoding_dx / tc.sim_dx)
+    tc.encoding_side      = int(round(np.sqrt(tc.Np)))
+    tc.encoding_x_num_sim = tc.encoding_side * tc.encoding_bin
 
     # Axial spacing between EVERY consecutive pair of planes -- PAPER (Sec.
     # 2.2) uses one uniform value for all such gaps (input/output pixel
@@ -239,13 +292,6 @@ def init_params():
     tc.slm_first_layer_spacing = _z   # PAPER (encoding-plane -> first-layer spacing)
     tc.last_layer_ccd_spacing  = _z   # PAPER (last-layer -> detector spacing)
 
-    # OBSOLETE -- was the no-layers-bypass propagation distance
-    # (propagator_no_layers / diffraction_efficiency()), both removed from
-    # model.py (num_layers > 0 is now required; still read as a fallback
-    # default by wave_prop.FreeSpaceProp when called with no explicit z, but
-    # nothing in this codebase calls it that way anymore).
-    tc.z_slm_ccd = _z
-
     # ------------------------------------------------------------------ #
     #  Photodiode array  (pd_num_rows x pd_num_cols detectors)             #
     #  ONE intensity detector per target function -- detector (r,c) reads #
@@ -260,16 +306,6 @@ def init_params():
     tc.pd_num_cols = 10
     tc.num_photodiodes = tc.pd_num_rows * tc.pd_num_cols
 
-    # NOTE: deviates from PAPER here. The paper specifies an inter-pixel gap of
-    # ~0.5*lambda (Sec. 2.2), i.e. center-to-center spacing = photodiode_size +
-    # 0.5*wavelength -- but at this project's sim_dx == pixel_pitch (300nm),
-    # that spacing (575nm = 1.917 sim-grid pixels) gets truncated by
-    # int(pd_row_spacing / sim_dx) down to 1 pixel -- i.e. the SAME as
-    # photodiode_pixels, so the detectors end up simulated as touching with NO
-    # gap at all (crosstalk risk), silently defeating the paper's own
-    # crosstalk-suppression intent. Using spacing = 2*photodiode_size instead
-    # guarantees a whole extra sim-grid pixel of real gap between detectors
-    # (spacing_px=2, photodiode_pixels=1) regardless of sim_dx.
     tc.pd_row_spacing = 4 * tc.photodiode_size  # center-to-center spacing, row direction
     tc.pd_col_spacing = 4 * tc.photodiode_size  # center-to-center spacing, column direction
     tc.pd_row_spacing_px = int(tc.pd_row_spacing / tc.sim_dx)
