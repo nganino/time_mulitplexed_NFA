@@ -1,29 +1,5 @@
 '''
 Time-Multiplexed NFA — config parameters
-
-NFA = Nonlinear Function Approximation. This project is transitioning from
-time-multiplexed image CLASSIFICATION (MNIST/CIFAR phase objects, differential
-photodiode-pair contrast, softmax cross-entropy) to time-multiplexed parallel
-NONLINEAR FUNCTION APPROXIMATION, following Rahman et al., "Massively parallel
-and universal approximation of nonlinear functions using diffractive
-processors" (eLight 2025) -- see PAPER references below -- with one addition
-of our own on top of it: a learned "phase-key" plane, time-multiplexed over
-M keys, whose per-key outputs are summed before detection ("wisdom of the
-crowd") to improve approximation accuracy for a FIXED set of Nf functions
-(the paper instead time-multiplexes wavelength to increase the NUMBER of
-functions -- see Sec. 2.2's multi-wavelength design -- which is a different
-goal from ours).
-
-Parameters below are tagged inline:
-  # PAPER: <value/section>        -- value taken directly from the paper
-  # NOTE: not specified in paper  -- our own choice, paper doesn't fix this
-  # OBSOLETE (classification-era) -- left in place for now, safe to delete;
-                                      superseded by the parameter named in
-                                      the comment. Not removed here so you
-                                      can track/delete these yourself.
-
-Data paths point to the parent project directory so the same datasets are
-shared. Logs are written to conv_decoder/logs/ to keep runs separate.
 '''
 
 import sys, os
@@ -66,15 +42,15 @@ def _build_log_paths(tc):
 
 def recompute_derived(tc):
     '''Recompute all params that depend on base physical values.'''
-    tc.slm_bin        = int(tc.slm_dx / tc.sim_dx)
+    tc.slm_bin        = round(tc.slm_dx / tc.sim_dx)
     tc.slm_x_num_sim  = tc.slm_x_num * tc.slm_bin
 
-    tc.photodiode_pixels = int(tc.photodiode_size / tc.sim_dx)
+    tc.photodiode_pixels = round(tc.photodiode_size / tc.sim_dx)
 
-    tc.pd_row_spacing_px = int(tc.pd_row_spacing / tc.sim_dx)
-    tc.pd_col_spacing_px = int(tc.pd_col_spacing / tc.sim_dx)
+    tc.pd_row_spacing_px = round(tc.pd_row_spacing / tc.sim_dx)
+    tc.pd_col_spacing_px = round(tc.pd_col_spacing / tc.sim_dx)
 
-    tc.layer_bin      = int(tc.layer_dx / tc.sim_dx)
+    tc.layer_bin      = round(tc.layer_dx / tc.sim_dx)
     tc.layer_size_sim = tc.layer_size * tc.layer_bin
 
     # ---- new NFA (function-approximation) derived params ------------------
@@ -85,11 +61,12 @@ def recompute_derived(tc):
     # (not just at init_params()) so `--set encoding_patch_scale=...` alone is
     # enough -- no separate encoding_dx/encoding_bin override needed.
     tc.encoding_dx        = tc.slm_dx * tc.encoding_patch_scale
-    tc.encoding_bin       = int(tc.encoding_dx / tc.sim_dx)
+    tc.encoding_bin       = round(tc.encoding_dx / tc.sim_dx)
     tc.encoding_side      = int(round(np.sqrt(tc.Np)))
     assert tc.encoding_side ** 2 == tc.Np, \
         'tc.Np must be a perfect square (square encoding patch, per the paper)'
-    tc.encoding_x_num_sim = tc.encoding_side * tc.encoding_bin
+    tc.encoding_x_num_sim = tc.encoding_bin * (
+        tc.encoding_side + (tc.encoding_side - 1) * tc.encoding_gap_blocks)
 
     tc.N_alpha = tc.Np  # PAPER (Sec. 4.1): "We set Nalpha = Np"
 
@@ -145,7 +122,7 @@ def init_params():
     tc.sim_dx = tc.pixel_pitch
     tc.N_sim  = 256
     tc.asm_pad_factor = 1
-    tc.r = 1.25 # scaling factor of the diffractive layer's feature count relative to the paper's 2*Np*Nf guideline
+    tc.r = 1.25 # scaling factor of the diffractive layer's feature count
 
     # ------------------------------------------------------------------ #
     #  Nonlinear function approximation -- targets & input encoding       #
@@ -167,26 +144,19 @@ def init_params():
                                   # at 1 (Sec. 4.1: "alpha_p = p - 1"). Exposed
                                   # here in case we ever want to change it.
 
-    tc.encoding_opaque_background = False  # NOTE: not specified in paper --
-                                  # our own knob. False (default): everywhere
-                                  # OUTSIDE the Np-pixel encoding patch is fully
-                                  # transparent (amplitude 1, phase 0), i.e. the
-                                  # behavior this project has always had. True:
-                                  # that background is OPAQUE (amplitude 0), so
-                                  # only the Np-pixel patch itself transmits
-                                  # light. See model._encode_input /
-                                  # encoding_aperture.
-    tc.encoding_patch_scale = 1   # NOTE: not specified in paper -- our own
-                                  # knob. Sim-grid pixels spanned by EACH
-                                  # encoding phase value (alpha_p), independent
-                                  # of slm_bin/layer_bin. 1 (default): one
-                                  # phase value == one sim pixel (today's
-                                  # behavior). 2: each of the Np phase values
-                                  # fills a 2x2 block of sim pixels instead
-                                  # (nearest-neighbor upsample in
-                                  # model._encode_input, same mechanism
-                                  # slm_bin/layer_bin already use). Feeds into
-                                  # tc.encoding_dx below.
+    tc.encoding_opaque_background = False  
+
+    tc.encoding_patch_scale = 1   # Sim-grid pixels spanned by EACH
+                                  # encoding phase value (alpha_p)
+
+    tc.encoding_gap_blocks = 0    # Number of BLANK bin-sized blocks
+                                  # inserted between adjacent encoding pixels,
+                                  # in both row and column directions -- each
+                                  # blank block is the same physical size as
+                                  # one pixel's own encoding_bin x
+                                  # encoding_bin block, so at patch_scale=2 a
+                                  # gap of 1 is itself a 2x2 blank block
+                                  # separating 2x2 pixel blocks.
 
     tc.func_seed = 0              # random seed for generating Nf target functinons
 
@@ -203,27 +173,17 @@ def init_params():
     #  NOT re-derived in recompute_derived(), so you can freely --set      #
     #  layer_size to something else later without this formula clobbering #
     #  it back.                                                            #
-    #  NOTE: moved before the phase-key plane section below because the    #
-    #  phase-key size (slm_x_num) now reuses layer_size directly -- see    #
-    #  that section's comment.                                             #
-    #  N now also scales with tc.M (2026-09-18 correction) -- so tc.M must #
-    #  be assigned before this point too; see its own assignment below,    #
-    #  moved up here for exactly that reason (kept next to num_layers      #
-    #  rather than down in the Phase-key plane section where it's          #
-    #  conceptually grouped, since Python needs it defined before use).    #
     # ------------------------------------------------------------------ #
     tc.M             = 1   # NOTE: not defined in paper -- number of learned
                            # phase keys (time-multiplexed conditioning masks).
-                           # Each key gives one independent estimate of f(a);
-                           # summing/averaging across keys before detection is
-                           # the "wisdom of the crowd" accuracy-improvement
-                           # mechanism this project adds. Moved up from the
-                           # Phase-key plane section below -- see comment above.
+
     tc.num_layers    = 2   # PAPER (Sec. 2.2): K
-    tc.N_trainable_features = int(np.ceil(tc.r * 2 * tc.Np * tc.Nf * tc.M))
+    tc.scale_layer_with_M = False  # N = r * 2*Np*Nf*M  (True) or N = r * 2*Np*Nf (False)
+    tc.N_trainable_features = int(np.ceil(
+        tc.r * 2 * tc.Np * tc.Nf * (tc.M if tc.scale_layer_with_M else 1))) #total  trainable features across all layers 
     tc.layer_dx      = tc.pixel_pitch  # PAPER: diffractive feature width == delta
     tc.layer_size    = int(np.ceil(np.sqrt(tc.N_trainable_features / tc.num_layers)))
-    tc.layer_bin      = int(tc.layer_dx / tc.sim_dx)
+    tc.layer_bin      = round(tc.layer_dx / tc.sim_dx)
     tc.layer_size_sim = tc.layer_size * tc.layer_bin
 
     # ------------------------------------------------------------------ #
@@ -249,8 +209,8 @@ def init_params():
     #  old, K/M-independent formula back.                                  #
     # ------------------------------------------------------------------ #
     tc.slm_dx      = tc.pixel_pitch
-    tc.slm_x_num   = tc.layer_size   # matches one diffractive layer's size -- see above
-    tc.slm_bin     = int(tc.slm_dx / tc.sim_dx)
+    tc.slm_x_num   = tc.layer_size   # phase key size matches diffractive layer size
+    tc.slm_bin     = round(tc.slm_dx / tc.sim_dx)
     tc.slm_x_num_sim = tc.slm_x_num * tc.slm_bin
 
     tc.slm_hw_x      = 1920  # NOTE: real-device pixel count, non-binding at
@@ -273,9 +233,10 @@ def init_params():
                                   # patch_scale > 1 widens each encoding phase
                                   # pixel beyond the paper's 1:1 pitch -- see
                                   # tc.encoding_patch_scale above.
-    tc.encoding_bin       = int(tc.encoding_dx / tc.sim_dx)
+    tc.encoding_bin       = round(tc.encoding_dx / tc.sim_dx)
     tc.encoding_side      = int(round(np.sqrt(tc.Np)))
-    tc.encoding_x_num_sim = tc.encoding_side * tc.encoding_bin
+    tc.encoding_x_num_sim = tc.encoding_bin * (
+        tc.encoding_side + (tc.encoding_side - 1) * tc.encoding_gap_blocks)
 
     # Axial spacing between EVERY consecutive pair of planes -- PAPER (Sec.
     # 2.2) uses one uniform value for all such gaps (input/output pixel
@@ -300,16 +261,16 @@ def init_params():
     #  pairing anymore. pd_num_rows * pd_num_cols must equal tc.Nf (asserted  #
     #  in recompute_derived).                                              #
     # ------------------------------------------------------------------ #
-    tc.photodiode_size   = tc.pixel_pitch      # PAPER (Sec. 2.2): detector width == delta
-    tc.photodiode_pixels = int(tc.photodiode_size / tc.sim_dx)
-    tc.pd_num_rows = 10   # 10 x 10 == Nf (100)
-    tc.pd_num_cols = 10
+    tc.photodiode_size   = tc.pixel_pitch      # one detector takes up one pixel (lambda/2)
+    tc.photodiode_pixels = round(tc.photodiode_size / tc.sim_dx)
+    tc.pd_num_rows = int(np.sqrt(tc.Nf))   # 10 x 10 == Nf (100)
+    tc.pd_num_cols = int(np.sqrt(tc.Nf))
     tc.num_photodiodes = tc.pd_num_rows * tc.pd_num_cols
 
-    tc.pd_row_spacing = 4 * tc.photodiode_size  # center-to-center spacing, row direction
-    tc.pd_col_spacing = 4 * tc.photodiode_size  # center-to-center spacing, column direction
-    tc.pd_row_spacing_px = int(tc.pd_row_spacing / tc.sim_dx)
-    tc.pd_col_spacing_px = int(tc.pd_col_spacing / tc.sim_dx)
+    tc.pd_row_spacing = 2 * tc.photodiode_size  # center-to-center spacing, row direction
+    tc.pd_col_spacing = 2 * tc.photodiode_size  # center-to-center spacing, column direction
+    tc.pd_row_spacing_px = round(tc.pd_row_spacing / tc.sim_dx)
+    tc.pd_col_spacing_px = round(tc.pd_col_spacing / tc.sim_dx)
 
     # Offset of the whole array's center, in sim-grid pixels relative to the optical
     # axis (N_sim/2). Default 0 centers the array on the axis. Nonzero shifts the
@@ -318,25 +279,11 @@ def init_params():
     tc.detector_offset_x = 0
 
     # ------------------------------------------------------------------ #
-    #  Nonlinear function approximation -- sampling of `a`                #
-    #  Training uses a FIXED POOL of randomly-drawn a values (Monte Carlo  #
-    #  over the continuous domain, resampled/reshuffled across epochs --  #
-    #  chosen instead of a fresh-every-batch infinite stream so the        #
-    #  existing epoch/checkpoint/logging infra keeps working unchanged).   #
-    #  Validation/test instead use a fixed, dense, EVENLY-SPACED grid, so  #
-    #  the reported per-function error approximates the paper's continuous #
-    #  RMSE integral (Eq. 16) with low variance, and target-vs-           #
-    #  approximation curves (like Fig. 2b/2c) come out smooth.             #
-    #  NOTE: none of these three sizes are specified by the paper -- their #
-    #  training loss (Eq. 11) is a closed-form PSF/Fourier-coefficient fit #
-    #  that never samples discrete a values at all (see design discussion);#
-    #  we can't reuse that shortcut once the phase-key plane + M-key      #
-    #  intensity-domain summing are added on top, so these are our own    #
-    #  choices, carried over from the old train_samples/val_samples scale. #
+    #  Nonlinear function approximation -- sampling of `a`. #
     # ------------------------------------------------------------------ #
-    tc.train_a_samples = 10000  
-    tc.val_a_grid_size  = 1000   
-    tc.test_a_grid_size = 1000  
+    tc.train_a_samples = 10000  # number of training samples of a
+    tc.val_a_grid_size  = 1000   # number of validation samples of a (grid)
+    tc.test_a_grid_size = 1000  # number of test samples of a (grid)
 
     # ------------------------------------------------------------------ #
     #  Training hyper-parameters                                          #
@@ -348,8 +295,8 @@ def init_params():
 
     tc.num_workers = 0
 
-    tc.lr_slm     = 1e-2   # learning rate for the phase-key plane (was: SLM mask)
-    tc.lr_layer   = 1e-2   # learning rate for the diffractive layers (unchanged role)
+    tc.lr_slm     = 1e-2   # learning rate for the phase-key plane
+    tc.lr_layer   = 1e-2   # learning rate for the diffractive layers
 
     tc.slm_warmup_epochs = 0
 

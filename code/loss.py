@@ -19,26 +19,6 @@ import torch.nn.functional as F
 #       batch statistics, see design discussion below)                       #
 #    4. MSE against the target (already normalized to [0,1] by               #
 #       target_functions.TargetFunctionSet)                                  #
-#                                                                              #
-#  HISTORY: this used to track running_min/running_max via an EMA (momentum  #
-#  = config.norm_momentum, now OBSOLETE/unused), updated only during         #
-#  training and frozen at eval -- mirroring the paper's Eq. 9 more literally.#
-#  A learning-rate sweep at M=1 (2026-09-17) showed val loss spiking to      #
-#  values like 146 (impossible for a bounded-[0,1] MSE) at EVERY tested LR,  #
-#  just less violently at lower LR. Inspecting checkpoints directly showed   #
-#  why: raw detector power collapses by 3-6 orders of magnitude over         #
-#  training AND swings unpredictably by up to ~1000x between checkpoints few #
-#  epochs apart -- nothing in the loss constrained overall optical power, so #
-#  the optimizer was free to let it wander. The EMA (a fixed-momentum,       #
-#  out-of-loop tracker) couldn't react fast enough to those sudden swings,   #
-#  so for a batch or two the normalization denominator was badly mismatched #
-#  with the current scale, producing exactly these blow-ups. Replacing it   #
-#  with a plain LEARNED affine transform removes that failure mode: scale/  #
-#  bias move smoothly via the SAME gradient descent as everything else (no  #
-#  separate momentum hyperparameter to desync), while still preserving the   #
-#  reason Eq. 9-style normalization exists in the first place -- the model   #
-#  only has to learn the right *shape* of f(a), not hit an absolute physical #
-#  intensity unit.                                                           #
 # =========================================================================== #
 
 class FunctionApproxLoss(nn.Module):
@@ -79,8 +59,9 @@ class FunctionApproxLoss(nn.Module):
         returns [B, Nf] : averaged over T, flattened per-detector -> per-function
         '''
         B = I_vec.shape[0]
-        I_mean = I_vec.mean(dim=1)          # [B, rows, cols] -- average over phase keys
-        return I_mean.reshape(B, self.Nf)   # [B, Nf], k = r * cols + c
+
+        I_integrated = I_vec.mean(dim=1)          # [B, rows, cols]
+        return I_integrated.reshape(B, self.Nf)   # [B, Nf], k = r * cols + c
 
     def normalize(self, I_summed):
         '''Learned affine transform -- see module-level HISTORY comment for

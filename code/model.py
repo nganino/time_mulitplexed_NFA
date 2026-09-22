@@ -58,6 +58,7 @@ class TimeMultiplexedNFA(nn.Module):
         self.encoding_x_num_sim = config.encoding_x_num_sim
         self.encoding_freq_step = float(getattr(config, 'encoding_freq_step', 1))
         self.encoding_opaque_background = bool(getattr(config, 'encoding_opaque_background', False))
+        self.encoding_gap_blocks = int(getattr(config, 'encoding_gap_blocks', 0))
 
         # Photodiode array (pd_num_rows x pd_num_cols detectors, replacing the single
         # photodiode). The array is centered on (N_sim/2 + detector_offset_y/x): with
@@ -125,16 +126,27 @@ class TimeMultiplexedNFA(nn.Module):
         layer_ap[..., ly0:ly1, ly0:ly1] = 1.0   # square aperture, same centering both axes
         self.register_buffer('layer_aperture', layer_ap)
 
-        # Function-input encoding-plane aperture: transparent everywhere by
-        # default (amplitude 1, config.encoding_opaque_background=False --
-        # today's behavior), or opaque outside the Np-pixel patch (amplitude 0,
-        # same centering _embed_in_sim uses for phi_in_sim) when True.
+        # Function-input encoding-plane aperture
         enc_ap = torch.ones(1, 1, self.N_sim, self.N_sim)
         if self.encoding_opaque_background:
             enc_ap.zero_()
+            side, gap = self.encoding_side, self.encoding_gap_blocks
+            cell_side = side + (side - 1) * gap
+            if gap > 0:
+                cell_mask = torch.zeros(1, 1, cell_side, cell_side)
+                idx = torch.arange(side) * (1 + gap)
+                cell_mask[..., idx[:, None], idx[None, :]] = 1.0
+                if self.encoding_bin != 1:
+                    cell_mask = F.interpolate(
+                        cell_mask,
+                        size=(self.encoding_x_num_sim, self.encoding_x_num_sim),
+                        mode='nearest'
+                    )
+            else:
+                cell_mask = torch.ones(1, 1, self.encoding_x_num_sim, self.encoding_x_num_sim)
             ey0 = (self.N_sim - self.encoding_x_num_sim) // 2
             ey1 = ey0 + self.encoding_x_num_sim
-            enc_ap[..., ey0:ey1, ey0:ey1] = 1.0
+            enc_ap[..., ey0:ey1, ey0:ey1] = cell_mask
         self.register_buffer('encoding_aperture', enc_ap)
 
         # Free-space propagators (key -> encoding plane, then through the
@@ -171,18 +183,32 @@ class TimeMultiplexedNFA(nn.Module):
         Deterministic function-input encoding (NOT learned) -- PAPER Sec.
         2.2/4.1: phi_in(p;a) = 2*pi*alpha_p*a, alpha_p = (p-1)*encoding_freq_step,
         over an encoding_side x encoding_side square patch of Np pixels
-        (row-major: p - 1 = row*encoding_side + col).
+        (row-major: p - 1 = row*encoding_side + col). If encoding_gap_blocks > 0,
+        blank bin-sized blocks are interleaved between adjacent pixels (both
+        rows and columns) -- see encoding_aperture (built in __init__) for the
+        matching transparent/opaque treatment of those gap blocks.
 
         a : [B] real tensor of scalar input values.
         returns phi_in_sim : [B, 1, N_sim, N_sim] real phase field (radians),
-        zero everywhere outside the Np-pixel encoding patch.
+        zero everywhere outside the Np-pixel encoding patch (and in any gap
+        blocks within it).
         '''
         B = a.shape[0]
         side = self.encoding_side
+        gap  = self.encoding_gap_blocks
         p_idx = torch.arange(side * side, device=a.device, dtype=a.dtype)
         alphas = p_idx * self.encoding_freq_step                     # [Np]
         phi_flat = 2 * np.pi * torch.einsum('b,p->bp', a, alphas)    # [B, Np]
-        phi_patch = phi_flat.view(B, 1, side, side)
+        phi_px = phi_flat.view(B, side, side) # B is the number of a samples (batch size)
+
+        if gap > 0:
+            cell_side = side + (side - 1) * gap
+            cell_phi = phi_px.new_zeros(B, cell_side, cell_side)
+            idx = torch.arange(side, device=a.device) * (1 + gap)
+            cell_phi[:, idx[:, None], idx[None, :]] = phi_px
+        else:
+            cell_phi = phi_px
+        phi_patch = cell_phi.unsqueeze(1)                             # [B, 1, cell_side, cell_side]
 
         if self.encoding_bin != 1:
             phi_patch = F.interpolate(
@@ -254,17 +280,15 @@ class TimeMultiplexedNFA(nn.Module):
         phi_in_sim  = self._encode_input(a)
         phi_slm_sim = self._get_slm_field()
 
-        # Phase-key plane -> propagate across key_to_enc_spacing to reach the
-        # encoding plane. The key field doesn't depend on B, so propagate once
-        # (per T) and expand after.
+        # Phase-key plane -> input plane
         U_slm        = self.slm_aperture * torch.exp(1j * phi_slm_sim) # [T, 1, N_sim, N_sim]
         U_at_enc     = self.prop_key_to_enc(U_slm) # [T, 1, N_sim, N_sim]
         U_at_enc_exp = U_at_enc[:, 0, :, :].unsqueeze(0) # [1, T, N_sim, N_sim]
-
-        U_in = self.encoding_aperture * torch.exp(1j * phi_in_sim)  # [B, 1, N_sim, N_sim]
-        U_in_exp = U_in.expand(-1, self.T, -1, -1) # [B, T, N_sim, N_sim]
-        U_flat = (U_at_enc_exp * U_in_exp).reshape(B * self.T, 1, self.N_sim, self.N_sim)
-
+        # Input plane perturbation
+        U_input = self.encoding_aperture * torch.exp(1j * phi_in_sim)  # [B, 1, N_sim, N_sim]
+        U_input_exp = U_input.expand(-1, self.T, -1, -1) # [B, T, N_sim, N_sim]
+        U_flat = (U_at_enc_exp * U_input_exp).reshape(B * self.T, 1, self.N_sim, self.N_sim)
+        # Diffractive layers -> detector plane
         field = self.prop_to_layer1(U_flat)
         for k in range(self.num_layers):
             layer_phase = self._get_layer_phase(k)
