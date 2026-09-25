@@ -146,8 +146,9 @@ def init_params():
 
     tc.encoding_opaque_background = False  
 
-    tc.encoding_patch_scale = 1   # Sim-grid pixels spanned by EACH
-                                  # encoding phase value (alpha_p)
+    tc.encoding_patch_scale = 1   # binning of the input pixels, 
+                                  # each p value takes up encoding_patch_scale x
+                                  # encoding_patch_scale simulation pixels
 
     tc.encoding_gap_blocks = 0    # Number of BLANK bin-sized blocks
                                   # inserted between adjacent encoding pixels,
@@ -193,20 +194,7 @@ def init_params():
     #  plane or per-key ensembling concept, so M's role/value below is    #
     #  not paper-derived.                                                 #
     #                                                                      #
-    #  slm_x_num == layer_size (own choice, 2026-09-18): each phase key is #
-    #  sized to match exactly ONE diffractive layer. Since layer_size now  #
-    #  also scales with M (2026-09-18 correction, above), total learnable  #
-    #  phases across the whole system work out to                         #
-    #      K * layer_size^2   (the D2NN)          ~= r*2*Np*Nf*M           #
-    #    + M * layer_size^2   (the M phase keys)  ~= r*2*Np*Nf*M^2/K       #
-    #    = r*2*Np*Nf*M * (1 + M/K)  -- note this now grows FASTER than     #
-    #  linearly in M (M and M^2 terms), unlike the pre-correction formula  #
-    #  (which only had the M*layer_size^2 term scale with M).             #
-    #  Previously slm_x_num had its OWN formula (same N budget, but        #
-    #  divided by a hardcoded 2 instead of tc.num_layers, and without the  #
-    #  M factor) which only coincidentally matched layer_size while        #
-    #  num_layers==2 and M==1 -- seek git history if you ever need that    #
-    #  old, K/M-independent formula back.                                  #
+    # Size of phase key matches the size of any given diffractive layer.   #
     # ------------------------------------------------------------------ #
     tc.slm_dx      = tc.pixel_pitch
     tc.slm_x_num   = tc.layer_size   # phase key size matches diffractive layer size
@@ -220,7 +208,7 @@ def init_params():
     tc.slm_bit_depth = 8
 
     tc.mask_init_method = 'normal'
-    tc.mask_init_std   = 0.5
+    tc.mask_init_std   = 1
 
     # ------------------------------------------------------------------ #
     #  Function-input encoding plane (deterministic, NOT learned)         #
@@ -267,8 +255,8 @@ def init_params():
     tc.pd_num_cols = int(np.sqrt(tc.Nf))
     tc.num_photodiodes = tc.pd_num_rows * tc.pd_num_cols
 
-    tc.pd_row_spacing = 2 * tc.photodiode_size  # center-to-center spacing, row direction
-    tc.pd_col_spacing = 2 * tc.photodiode_size  # center-to-center spacing, column direction
+    tc.pd_row_spacing = 3 * tc.photodiode_size  # center-to-center spacing, row direction
+    tc.pd_col_spacing = 3 * tc.photodiode_size  # center-to-center spacing, column direction
     tc.pd_row_spacing_px = round(tc.pd_row_spacing / tc.sim_dx)
     tc.pd_col_spacing_px = round(tc.pd_col_spacing / tc.sim_dx)
 
@@ -306,7 +294,7 @@ def init_params():
     tc.freeze_slm = False  # freezes the phase-key plane (was: SLM mask)
                                           #
     # ------------------------------------------------------------------ #
-    tc.loss_type = 'mse'      # NOTE: not defined in paper -- superseded loss_mode
+    tc.loss_type = 'mse'      
 
     # ------------------------------------------------------------------ #
     #  Logging & checkpoints        #

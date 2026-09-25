@@ -189,51 +189,18 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
     # ---- top-right: spatial error heatmap -----------------------------------
     # Detector (r, c) reads function k = r*pd_num_cols + c (matches model.py's
     # _integrate_photodiode_array), so the RMSE vector reshapes straight into
-    # that grid and is placed at the detectors' true physical spacing.
-    # Detectors don't tile the plane (real gap = pd_row/col_spacing -
-    # photodiode_size, see config.py) -- imshow's own bilinear resampling
-    # fills that gap purely for legibility (a visualization smoothing, not a
-    # physical measurement), and the true detector footprints are drawn to
-    # scale (actual photodiode_size, not a cosmetic marker) so the real fill
-    # factor is visible.
+    # that grid. The dead space between detectors is collapsed: each detector
+    # is one equal-size block colored by its own RMSE (no interpolation), so
+    # this is a table of detectors, not a physical-scale map.
     ax_heat = fig.add_subplot(gs[0, hist_w + cx_w:])
     rows, cols = config.pd_num_rows, config.pd_num_cols
     grid = rmse_np.reshape(rows, cols)   # row-major k = r*cols + c, matches model.py
 
-    height_um = (rows - 1) * config.pd_row_spacing * 1e6
-    width_um  = (cols - 1) * config.pd_col_spacing * 1e6
-    row_step_um = config.pd_row_spacing * 1e6
-    col_step_um = config.pd_col_spacing * 1e6
-
-    # Edge-pad the grid by one step on every side (nearest-value extrapolation)
-    # and grow imshow's own extent to match, so the margin around the true
-    # detector array is real (if extrapolated) heatmap color, not blank axes
-    # background -- then only show a slice of that padded margin (via
-    # xlim/ylim below), just enough to clear the edge detectors' squares.
-    grid_padded = np.pad(grid, pad_width=1, mode='edge')
-    extent = [-width_um / 2 - col_step_um, width_um / 2 + col_step_um,
-              -height_um / 2 - row_step_um, height_um / 2 + row_step_um]
-
-    im = ax_heat.imshow(grid_padded, cmap='hot', origin='lower', extent=extent,
-                         interpolation='bilinear')
-    ys = np.linspace(-height_um / 2, height_um / 2, rows)
-    xs = np.linspace(-width_um / 2, width_um / 2, cols)
-    pd_w_um = config.photodiode_size * 1e6
-    for yy in ys:
-        for xx in xs:
-            ax_heat.add_patch(Rectangle(
-                (xx - pd_w_um / 2, yy - pd_w_um / 2), pd_w_um, pd_w_um,
-                facecolor='none', edgecolor='white', linewidth=0.7, alpha=0.85))
-    # Clip the view to just past the outermost detectors' squares (which
-    # extend photodiode_size/2 beyond the last detector CENTER) -- comfortably
-    # inside the one-full-step padded region above, so this margin is always
-    # real (extrapolated) heatmap color, never blank.
-    margin_um = pd_w_um
-    ax_heat.set_xlim(-width_um / 2 - margin_um, width_um / 2 + margin_um)
-    ax_heat.set_ylim(-height_um / 2 - margin_um, height_um / 2 + margin_um)
-    ax_heat.set_xlabel('detector-plane x (µm)')
-    ax_heat.set_ylabel('detector-plane y (µm)')
-    ax_heat.set_title('Spatial RMSE map', fontsize=10)
+    im = ax_heat.imshow(grid, cmap='hot', origin='lower', interpolation='nearest',
+                         aspect='equal')
+    ax_heat.set_xlabel(f'detector column (CtoC spacing {config.pd_col_spacing_px} px)')
+    ax_heat.set_ylabel(f'detector row (CtoC spacing {config.pd_row_spacing_px} px)')
+    ax_heat.set_title(f'Per-detector RMSE (pd size = {config.photodiode_pixels} px)', fontsize=10)
     cbar = fig.colorbar(im, ax=ax_heat, fraction=0.046, pad=0.04)
     cbar.set_label('RMSE')
     # Format each tick as its own scientific-notation value rather than a
@@ -268,25 +235,6 @@ def _save_mask_similarity(model, out_dir, dpi=200):
     sim-grid version).
 
     similarity(i, j) = | mean_pixels( exp(i * (phi_i - phi_j)) ) |, in [0, 1].
-
-    This is a circular (phase-aware) similarity, not a naive Euclidean/cosine
-    one -- raw phase values wrap at 2pi, so comparing them directly would
-    treat e.g. 0.01 and 2*pi-0.01 as maximally different when they're
-    actually almost identical. It's also deliberately invariant to a constant
-    phase offset between two keys: a uniform additive shift to an entire key
-    doesn't change its own detected intensity (it cancels under |field|^2),
-    so two keys differing only by such a constant really do produce
-    redundant measurements and should score as maximally similar (1.0), not
-    different.
-
-    1.0 = identical up to a constant offset (fully redundant, no benefit from
-    averaging this pair); 0.0 = pixel-wise phase differences are spread
-    uniformly around the circle (no consistent relationship -- these two
-    keys are learning genuinely different things, which is what the "wisdom
-    of the crowd" ensembling this project adds is supposed to produce).
-
-    Saves one M x M heatmap to out_dir/phase_key_similarity.png.
-    Returns the [M, M] numpy similarity array (None if M < 2).
     '''
     M = model.M
     with torch.no_grad():
@@ -367,6 +315,108 @@ def _save_layer_masks(model, out_dir, dpi=200):
     print(f'Layer masks saved → {path}')
 
 
+def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
+    '''
+    M rows x 3 columns, one row per phase key m:
+      col 1: learned phase key m
+      col 2: intensity key m deposits on the encoding plane (cropped to the
+             layer aperture, footprint of the encoding region outlined, mean
+             footprint intensity vs. the unit
+             incident intensity -- NOT a power fraction, since the key aperture
+             fills the whole grid and most power is unmodulated background)
+      col 3: target vs. approximation using keys 0..m only (mean of the first
+             m+1 per-key detector readouts through the trained affine readout),
+             for the median-error function of the FULL model, held fixed across
+             rows. The last row reproduces the ordinary test result.
+    Key order is arbitrary (the keys are averaged symmetrically), and the
+    readout scale/bias were trained for the full M-average, so partial sums
+    need not improve monotonically.
+    '''
+    M = model.M
+    if M < 2:
+        print('[key_evolution] M < 2 -- skipping.')
+        return
+
+    criterion = FunctionApproxLoss(config).to(device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if ckpt.get('criterion') is not None:
+        criterion.load_state_dict(ckpt['criterion'], strict=False)
+    criterion.eval()
+
+    _, _, test_loader, _ = get_function_approx_dataloaders(config)
+    a_l, I_l, t_l = [], [], []
+    with torch.no_grad():
+        for a, target in tqdm(test_loader, desc='Per-key eval'):
+            I_l.append(model(a.to(device)).cpu())      # [B, M, rows, cols]
+            a_l.append(a); t_l.append(target)
+    a_all = torch.cat(a_l); target = torch.cat(t_l)
+    order = torch.argsort(a_all)
+    a_all, target = a_all[order], target[order]
+    I_all = torch.cat(I_l)[order]
+    I_all = I_all.reshape(I_all.shape[0], M, -1)       # [N, M, Nf], k = r*cols + c
+
+    with torch.no_grad():
+        f_cum = [criterion.normalize(I_all[:, :m + 1].mean(1).to(device)).cpu() for m in range(M)]
+        key_I = model.key_intensity_at_encoding().cpu().numpy()   # [M, N_sim, N_sim]
+        phases = (torch.sigmoid(model.slm_phases) * 2 * np.pi).cpu().numpy()[:, 0]
+
+    rmse_cum = [FunctionApproxLoss.per_function_rmse(f, target) for f in f_cum]
+    k = int(torch.argsort(rmse_cum[-1])[len(rmse_cum[-1]) // 2])
+
+    N = model.N_sim
+    L = model.layer_size_sim
+    E = model.encoding_x_num_sim
+    ly0 = (N - L) // 2
+    ey0 = (N - E) // 2
+
+    fig, axes = plt.subplots(M, 3, figsize=(13, 3.2 * M), dpi=dpi, squeeze=False)
+    tgt = target[:, k].numpy(); a_np = a_all.numpy()
+    for m in range(M):
+        ax = axes[m, 0]
+        ax.imshow(phases[m], cmap='twilight', vmin=0, vmax=2 * np.pi)
+        ax.set_ylabel(f'key {m}', fontsize=11, fontweight='bold')
+        ax.set_xticks([]); ax.set_yticks([])
+        if m == 0:
+            ax.set_title('Phase key', fontsize=11, fontweight='bold')
+
+        ax = axes[m, 1]
+        I = key_I[m]
+        enh = I[ey0:ey0 + E, ey0:ey0 + E].mean()   # incident (unit-amplitude) intensity == 1
+        crop = I[ly0:ly0 + L, ly0:ly0 + L]
+        ax.imshow(crop, cmap='inferno')
+        ax.add_patch(Rectangle((ey0 - ly0 - 0.5, ey0 - ly0 - 0.5), E, E,
+                                fill=False, edgecolor='cyan', linewidth=1.2))
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlabel(f'mean intensity in footprint = {enh:.1f}x incident', fontsize=9)
+        if m == 0:
+            ax.set_title('Intensity at encoding plane (cyan = footprint)', fontsize=11, fontweight='bold')
+
+        ax = axes[m, 2]
+        ax.plot(a_np, tgt, '-', color='black', label='target')
+        ax.plot(a_np, f_cum[m][:, k].numpy(), '-.', color='tab:red', label='approx')
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_title(f'keys 0..{m}   RMSE(f_{k})={rmse_cum[m][k]:.2e}   mean RMSE={rmse_cum[m].mean():.2e}',
+                     fontsize=9)
+        if m == M - 1:
+            ax.set_xlabel('a')
+        if m == 0:
+            ax.legend(fontsize=7, loc='upper right')
+            ax.annotate('Cumulative approximation', xy=(0.5, 1), xytext=(0, 26),
+                        xycoords='axes fraction', textcoords='offset points',
+                        ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+    fig.suptitle(
+        'Phase-key evolution  (function shown: median-error f_%d of the full model)\n' % k +
+        r'($N = r \cdot 2 N_p N_f$,  ' +
+        f'r={config.r}  Np={config.Np}  Nf={config.Nf}  M={config.M}  K={config.num_layers})',
+        fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    path = os.path.join(out_dir, 'key_evolution.png')
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Key evolution saved → {path}')
+
+
 # ──────────────────────────── main entry point ────────────────────────────── #
 
 def _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse):
@@ -376,10 +426,10 @@ def _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse):
         'label'     : run_label  or '',
         'ckpt'      : ckpt_path  or '',
         'n_samples' : len(agg['a']),
-        'loss_mean' : round(float(np.mean(agg['loss'])), 6),
-        'rmse_mean' : round(float(rmse.mean()), 6),
-        'rmse_max'  : round(float(rmse.max()), 6),
-        'rmse_min'  : round(float(rmse.min()), 6),
+        'loss_mean' : float(np.mean(agg['loss'])),
+        'rmse_mean' : float(rmse.mean()),
+        'rmse_max'  : float(rmse.max()),
+        'rmse_min'  : float(rmse.min()),
     }
     file_exists = os.path.exists(csv_path)
     with open(csv_path, 'a', newline='') as f:
@@ -459,6 +509,8 @@ def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_l
     _save_phase_keys(model, out_dir)
     _save_layer_masks(model, out_dir)
     _save_mask_similarity(model, out_dir)
+    if ckpt_path is not None:
+        _save_key_evolution(model, config, ckpt_path, device, out_dir)
 
     print(f'\nAll outputs saved to: {os.path.abspath(out_dir)}')
 

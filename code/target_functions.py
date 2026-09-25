@@ -38,7 +38,7 @@ class TargetFunctionSet:
 
     def __init__(self, config):
         self.Nf       = int(config.Nf)
-        self.N_alpha  = int(config.N_alpha)   # == Np, see config.recompute_derived
+        self.N_alpha  = int(config.N_alpha)   # number of harmonics == Np, see config.recompute_derived
         self.freq_step = float(getattr(config, 'encoding_freq_step', 1))
 
         # alpha_i = (i-1) * freq_step, i = 1..N_alpha  (PAPER Sec. 4.1)
@@ -55,7 +55,7 @@ class TargetFunctionSet:
         # with a dense grid (NOTE: grid resolution not specified in paper --
         # our own choice, generous enough for a stable estimate).
         calib_a    = torch.linspace(config.a_min, config.a_max, 2001, dtype=torch.float64)
-        calib_vals = self._raw(calib_a)   # [2001, Nf]
+        calib_vals = self._raw(calib_a)   # [2001, Nf], Nf columns to represent each function
         self.f_min = calib_vals.min().item()
         self.f_max = calib_vals.max().item()
         assert self.f_max > self.f_min, (

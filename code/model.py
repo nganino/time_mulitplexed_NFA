@@ -178,6 +178,12 @@ class TimeMultiplexedNFA(nn.Module):
             )
         return self._embed_in_sim(phi)
 
+    def key_intensity_at_encoding(self):
+        '''[T, N_sim, N_sim] intensity each phase key deposits on the encoding
+        plane. Input-independent (the encoding is phase-only), so no `a` needed.'''
+        U = self.slm_aperture * torch.exp(1j * self._get_slm_field())
+        return self.prop_key_to_enc(U)[:, 0].abs().pow(2)
+
     def _encode_input(self, a):
         '''
         Deterministic function-input encoding (NOT learned) -- PAPER Sec.
