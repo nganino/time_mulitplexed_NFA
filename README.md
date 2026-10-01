@@ -27,7 +27,7 @@ a couple of pre-existing-but-still-inaccurate leftover comments to be aware of.
 
 ```
 Phase-key plane (LEARNED, T == M keys, time-multiplexed)
-   phi_key ~ sigmoid(slm_phases) * 2*pi          [T, 1, slm_x_num, slm_x_num]
+   phi_key ~ sigmoid(slm_phases) * 2*pi          [T, 1, phase_key_size, phase_key_size]
         |
         | propagate across key_to_enc_spacing  (FreeSpaceProp)
         v
@@ -122,32 +122,61 @@ Current defaults (paper-scale regime, adopted 2026-09-17):
 | targets | `a_min`, `a_max` | -0.5, 0.5 | PAPER |
 | targets | `func_seed` | 0 | our reproducibility knob (paper only specifies the sampling distributions, Eq. 10) |
 | phase key | `M` | 1 | our addition, not paper-derived; **the whole point of this project is to sweep this** |
+| phase key | `key_train_region` | `'all'` | which key pixels train (2026-09-29). `'outside_footprint'` (= old `key_mask_encoder_footprint=true`): the encoder footprint is pinned to phase 0. `'footprint_only'`: stage-2 fine-tune where only the footprint trains and the rest of the key is frozen (layers + readout still train), e.g. `--set key_to_enc_spacing=0 key_train_region=footprint_only ckpt_to_load=<z0_masked run>/model/best.pth load_weights_only=true`. Loading a pinned-footprint checkpoint into a run that trains the footprint (`footprint_only` or `all`) starts the footprint at exactly phase 0 (buffer `key_phase_offset` = pi there, raw params reset to 0), so step 0 reproduces the stage-1 model |
 | layers | `num_layers` (K) | 2 | PAPER's default/main design (K=4 is their deeper alt.) |
-| layers | `layer_size` | `ceil(sqrt(1.25*2*Np*Nf/K))` = 34 | PAPER's guideline `N ~= 1.25*2*Np*Nf` total features -- computed ONCE as a starting default in `init_params()`, NOT re-derived in `recompute_derived()`, so `--set layer_size=X` sticks |
-| phase key | `slm_x_num` | `= layer_size` (34 by default) | own choice (2026-09-18): each phase key sized to match ONE diffractive layer, so total learnable phases = `K*layer_size^2 + M*layer_size^2` = `r*2*Np*Nf*(1+M/K)` -- also a ONE-TIME init value, does NOT auto-track a later `--set layer_size=X` |
-| spacings | `key_to_enc_spacing`, `slm_first_layer_spacing`, `interlayer_spacing`, `last_layer_ccd_spacing` | all == `z = W*sqrt((2*pixel_pitch/wavelength)^2 - 1)` ~= 4.45 um, `W = layer_size*layer_dx` | PAPER uses ONE uniform value for every plane-to-plane gap (Sec. 2.2); we apply the same value to the key->encoding gap too even though it has no paper analogue. Also a ONE-TIME init value tied to `layer_size` -- changing `layer_size` via `--set` does NOT recompute these |
-| detector | `pd_num_rows`, `pd_num_cols` | 10, 10 (== Nf) | must satisfy `rows*cols == Nf`, asserted |
-| detector | `photodiode_size` | `= pixel_pitch` | PAPER: detector width == delta |
-| detector | `pd_row/col_spacing` | `4 * photodiode_size` | **Deviates from PAPER's `photodiode_size + 0.5*wavelength`** -- that spacing (1.9 sim-grid pixels) got silently truncated by `int()` to 1 pixel (== photodiode_size itself), i.e. detectors simulated as touching with NO real gap, defeating the paper's own crosstalk-suppression intent. Fixed 2026-09-18 by tying spacing to a whole multiple of `photodiode_size` instead -- see "Known open items" below for the crosstalk-sweep finding that motivated this |
+| layers | `layer_size` | `ceil(sqrt(N/K))`, `N = N_trainable_features = ceil(r*2*Np*Nf)` (34 at Np=9, Nf=100, K=2) | PAPER's guideline `N ~= 1.25*2*Np*Nf` total features. **DERIVED** in `recompute_derived()` from the current Np/Nf/K/M/r unless you `--set layer_size=X` (then X sticks) -- see "How `--set` works" below. `scale_layer_with_M=true` multiplies N by M |
+| phase key | `phase_key_size` (was `slm_x_num` before 2026-09-28; also `slm_bin`->`phase_key_bin`, `slm_x_num_sim`->`phase_key_size_sim`; old names still accepted via `config.LEGACY_ALIASES`) | `= layer_size` | own choice (2026-09-18): each phase key sized to match ONE diffractive layer, so total learnable phases = `K*layer_size^2 + M*layer_size^2` = `r*2*Np*Nf*(1+M/K)`. **DERIVED** (follows `layer_size`, including a `--set layer_size=X`) unless set explicitly; a mismatch prints a WARNING at train start |
+| spacings | `key_to_enc_spacing`, `slm_first_layer_spacing`, `interlayer_spacing`, `last_layer_ccd_spacing` | all 6 um (fixed) | Since 2026-09-24 a FIXED 6 um instead of the paper's `z = W*sqrt((2*pixel_pitch/wavelength)^2 - 1)` (still in config.py, commented out): the diffraction walk-off is then ~46 px regardless of aperture, so N_sim=256 works for any `layer_size <= 164`. Not derived -- `--set` to change. At `key_to_enc_spacing=0` the key->encoding propagator is skipped and the encoding-plane field is exactly `exp(j*(phi_key + phi_enc))` (`key_to_enc_exact_at_zero`, default True since 2026-09-28; checkpoints saved earlier load it as False via `config.LEGACY_DEFAULTS`, i.e. their original propagated behavior) |
+| detector | `pd_num_rows`, `pd_num_cols` | `sqrt(Nf)` each (10 x 10 at Nf=100) | **DERIVED** unless set; product must equal Nf (asserted). For a non-square Nf, `--set` one side and the other becomes Nf / that side |
+| detector | `photodiode_size` | `3 * pixel_pitch` (3 sim px, since 2026-09-28; was 1 px) | detector width; its reading is the MEAN intensity over its `photodiode_pixels x photodiode_pixels` window. 2-3 px detectors largely removed the need for many phase keys at M=1 (SWEEP_HANDOVER 4o/4p) |
+| detector | `pd_row/col_spacing` | `3 * pixel_pitch` (fixed 3 px pitch) | center-to-center pitch, NOT tied to `photodiode_size` (since 2026-09-28): with the 3 px default detectors they touch (fill fraction 1). Always a whole number of sim pixels -- the old `photodiode_size + 0.5*wavelength` (paper) spacing got truncated to 1 px by `int()`, see "Known open items" |
 | sampling | `train_a_samples` | 10000 | fixed pool, resampled/reshuffled each epoch (NOT regenerated -- drawn once, seeded by `config.seed`) |
 | sampling | `val_a_grid_size`, `test_a_grid_size` | 1000, 1000 | dense EVENLY-SPACED grids (not random) -- approximates the paper's continuous RMSE integral (Eq. 16) with low variance and gives gap-free plots |
 | loss | `loss_type` | `'mse'` | only `'mse'` is implemented |
 | loss | `norm_momentum` | 0.1 | **OBSOLETE** -- was the EMA rate for the old running Pmin/Pmax buffers; `loss.py` now uses a learned scale/bias instead (see "Known open items") |
-| training | `batch_size`, `max_epoch`, `lr_slm`, `lr_layer` | 12, 100, 1e-2, 1e-2 | `lr_slm` applies to the phase-key plane (name kept from the old SLM-mask era); also reused as the LR for `loss.py`'s learned scale/bias (`opt_readout` in `train.py`) |
+| training | `batch_size`, `max_epoch`, `lr_slm`, `lr_layer` | 64, 150, 1e-2, 1e-2 | `lr_slm` applies to the phase-key plane (name kept from the old SLM-mask era); also reused as the LR for `loss.py`'s learned scale/bias (`opt_readout` in `train.py`) |
 
-`recompute_derived(config)` must be called after any `--set` override that changes
-a base physical value (`train.py`/`test.py` already do this) -- it recomputes bin
-factors, `encoding_side`, `T`, `run_name`/log paths, and asserts `Np` is a perfect
-square and `pd_num_rows*pd_num_cols == Nf`.
+### How `--set` works ("derive unless you set it", since 2026-09-28)
+
+`python train.py --set KEY=VALUE ...` overrides any config.py value (type preserved).
+Then `recompute_derived()` recomputes everything that depends on other values:
+
+- **Design values** -- `N_trainable_features`, `layer_size`, `phase_key_size`,
+  `pd_num_rows`, `pd_num_cols` -- are re-derived from their formulas (table above)
+  every time, **unless you `--set` them yourself**, in which case your value sticks.
+  So `--set Np=25` alone gives 56 px layers and keys; `--set Nf=1024 num_layers=3`
+  gives 88 px layers and a 32 x 32 detector grid; `--set layer_size=60` also moves the
+  keys to 60 (they follow `layer_size`).
+- **Pure geometry** -- bin factors, `*_sim` sizes, `*_px` spacings, `encoding_side`,
+  `N_alpha`, `T`, `run_name`/log paths -- is always recomputed.
+- **Everything else** (spacings, detector size/pitch, lr, epochs, ...) is just the
+  config.py value or your `--set` value; nothing derives it.
+
+Which keys you set is tracked in `tc._explicit` (`train.py`'s `_apply_overrides` calls
+`mark_explicit`); it is never written to `config.json`. At train start the design
+values are printed and written to `LOG.txt`, tagged `[set]` or `[derived]`, e.g.
+`layer_size = 56 [derived]  (formula: ceil(sqrt(N/K)), K=2)`.
+
+**Loading a checkpoint** (`test.py`) uses `apply_saved_config()`, which marks EVERY
+saved key explicit -- the model is rebuilt exactly as trained, even if a formula
+or default has changed since (verified on old checkpoints, incl. the 125 px
+`scale_layer_with_M` runs). Scripts that load a checkpoint config themselves should
+use `apply_saved_config(cfg, ckpt["config"]); recompute_derived(cfg)`, NOT
+`cfg.__dict__.update(...)`, which would let design values be re-derived.
+
+Old key names (`slm_x_num` etc.) are still accepted in `--set` and in saved configs
+(`config.LEGACY_ALIASES`). Sweep scripts from before 2026-09-28 that pass every
+value explicitly still work unchanged -- they just no longer need to.
 
 ## File-by-file reference
 
 ### `config.py`
 Single source of truth for every parameter (see table above) plus `run_name`/
-log-path construction. `init_params()` builds defaults; `recompute_derived(tc)`
-recomputes everything that depends on base physical values (call this after
-applying `--set` overrides). `config_to_dict(tc)` flattens to a JSON-serializable
-dict for checkpoints/`config.json`.
+log-path construction. `init_params()` builds defaults and ends by calling
+`recompute_derived(tc)`, which derives every dependent value (design values only
+if not set explicitly -- see "How `--set` works" above). `mark_explicit`,
+`apply_saved_config` and `describe_design` support that; `config_to_dict(tc)`
+flattens to a JSON-serializable dict for checkpoints/`config.json`.
 
 ### `target_functions.py`
 `TargetFunctionSet(config)`: generates `Nf` fixed random Fourier-coefficient sets
@@ -237,8 +266,8 @@ only.** Key pieces:
   country/member grid
 - `save_layer_masks()`: unchanged in spirit, docstring updated
 
-Usage: `python train.py --set M=5 lr_slm=5e-3` etc. (`--set KEY=VALUE`, any type,
-preserved).
+Usage: `python train.py --set Np=25 M=3` etc. (`--set KEY=VALUE`, any type,
+preserved; dependent sizes follow automatically -- see "How `--set` works").
 
 ### `test.py`
 Standalone eval script, also rewritten in place. `evaluate(ckpt_path, out_dir,
@@ -401,20 +430,13 @@ per_function_rmse(f_hat, target)   [Nf]
   batch size used for sweeps in this repo, though `config.py`'s own default is
   left at 12 (not changed without being asked). Worth re-benchmarking batch
   size again if the model's shape (`Np`/`Nf`/`layer_size`/`M`) changes a lot.
-- **`layer_size`/`slm_x_num` are computed once (`init_params()`) and NOT
-  re-derived in `recompute_derived()`** -- if you `--set Np=...` or
-  `--set Nf=...`, you must manually recompute/re-set both yourself; they will
-  NOT automatically track the new Np/Nf. As of 2026-09-18, `slm_x_num` is
-  literally set to `tc.layer_size` (each phase key is deliberately sized to
-  match one diffractive layer, so total learnable phases work out to
-  `K*layer_size^2 + M*layer_size^2` = `r*2*Np*Nf * (1 + M/K)`) -- so a
-  `--set layer_size=X` alone is enough to keep them matched AT DEFAULT time,
-  but this is still a one-time init value: overriding `layer_size` via
-  `--set` after the fact does NOT retroactively update `slm_x_num`, so you
-  must still pass both explicitly together (e.g.
-  `--set Np=25 layer_size=56 slm_x_num=56 ...`, see `logs/M_sweep_pd2px_Np25/`
-  for a worked example, which also had to recompute the paper-tied spacings
-  for the new layer_size).
+- **RESOLVED 2026-09-28 -- `layer_size`/`phase_key_size` used to be computed only
+  once at `init_params()`** (from the default Np=9/Nf=100/K=2), so `--set Np=25`
+  alone silently trained 34 px layers, and every sweep had to pass `layer_size`,
+  `phase_key_size`, `pd_num_rows/cols` explicitly. They are now derived after
+  overrides unless set -- see "How `--set` works". The same change fixed
+  `python train.py` with NO `--set` crashing (`N_alpha`/`T` were only set by
+  `recompute_derived()`, which then only ran when overrides were given).
 - **Diffraction-efficiency loss penalty (paper Eq. 13/14, `LDE`) was
   deliberately NOT implemented** -- explicit decision to keep the first version
   to plain MSE only; revisit once the core M-key accuracy idea is validated.
@@ -425,7 +447,7 @@ per_function_rmse(f_hat, target)   [Nf]
   bullet above) found a striking, Np-dependent split: at Np=9
   (`logs/M_sweep_pd2px/`) M gave a >3000x rmse_mean reduction (0.0064 ->
   2.3e-6); at Np=25 (`logs/M_sweep_pd2px_Np25/`, needed `layer_size`/
-  `slm_x_num`=56 and the four spacings recomputed, see below) M gave <2x
+  `phase_key_size`=56 and the four spacings recomputed, see below) M gave <2x
   (0.0097 -> 0.0053). Comparison plot: `logs/M_sweep_Np9_vs_Np25_rmse.png`.
   Leading hypothesis: Np=25 may be capacity-limited (layer_size only grew
   34->56 while Np grew 9->25) rather than crosstalk/redundancy-limited --

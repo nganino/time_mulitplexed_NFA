@@ -42,7 +42,7 @@ from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter
 
-from config import init_params, recompute_derived
+from config import init_params, recompute_derived, apply_saved_config
 from model import TimeMultiplexedNFA
 from dataloader import get_function_approx_dataloaders
 from loss import FunctionApproxLoss
@@ -61,6 +61,8 @@ def _eval_loop(model, loader, criterion, device, desc='Evaluating'):
         'f_hat'  : [N, Nf] normalized model output
         'target' : [N, Nf] true (already [0,1]-normalized) function values
         'loss'   : per-batch MSE (one value per batch, NOT sorted -- just a list)
+        'de'     : [N, T] diffraction efficiency per sample and phase key
+                   (diagnostic only, see loss.FunctionApproxLoss.diffraction_efficiency)
     '''
     agg = defaultdict(list)
     was_training_model = model.training
@@ -68,6 +70,7 @@ def _eval_loop(model, loader, criterion, device, desc='Evaluating'):
     model.eval(); criterion.eval()
 
     with torch.no_grad():
+        incident = model.incident_energy()
         for a, target in tqdm(loader, desc=desc):
             a = a.to(device); target = target.to(device)
             I_vec = model(a)
@@ -77,6 +80,7 @@ def _eval_loop(model, loader, criterion, device, desc='Evaluating'):
             agg['a'].append(a.cpu())
             agg['f_hat'].append(f_hat.cpu())
             agg['target'].append(target.cpu())
+            agg['de'].append(criterion.diffraction_efficiency(I_vec, incident).cpu())
 
     if was_training_model:
         model.train()
@@ -86,11 +90,13 @@ def _eval_loop(model, loader, criterion, device, desc='Evaluating'):
     agg['a']      = torch.cat(agg['a'])
     agg['f_hat']  = torch.cat(agg['f_hat'])
     agg['target'] = torch.cat(agg['target'])
+    agg['de']     = torch.cat(agg['de'])
 
     order = torch.argsort(agg['a'])
     agg['a']      = agg['a'][order]
     agg['f_hat']  = agg['f_hat'][order]
     agg['target'] = agg['target'][order]
+    agg['de']     = agg['de'][order]
 
     return agg
 
@@ -104,6 +110,13 @@ def _print_summary(agg, tag='Test'):
     print(f'  Loss (MSE)          : {np.mean(agg["loss"]):.4e}')
     print(f'  Per-function RMSE   : mean={rmse.mean():.4e}  '
           f'max={rmse.max():.4e}  min={rmse.min():.4e}')
+    if 'de' in agg:
+        de = agg['de']                                     # [N, T]
+        print(f'  Diffraction eff.    : mean={de.mean():.4e}  '
+              f'max={de.max():.4e}  min={de.min():.4e}')
+        if de.shape[1] > 1:
+            per_key = '  '.join(f'{v:.3e}' for v in de.mean(dim=0).tolist())
+            print(f'    per key (mean)    : {per_key}')
     print(f'──────────────────────────────────────────────────────────\n')
     return rmse
 
@@ -230,7 +243,7 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
 def _save_mask_similarity(model, out_dir, dpi=200):
     '''
     Pairwise circular-phase similarity between the M phase keys, on the
-    model's raw learned phase (post-sigmoid, at its native slm_x_num
+    model's raw learned phase (post-sigmoid, at its native phase_key_size
     resolution -- the actual learnable parameter, not the upsampled/embedded
     sim-grid version).
 
@@ -238,7 +251,7 @@ def _save_mask_similarity(model, out_dir, dpi=200):
     '''
     M = model.M
     with torch.no_grad():
-        phi = (torch.sigmoid(model.slm_phases) * 2 * np.pi)[:, 0]   # [M, slm_x_num, slm_x_num]
+        phi = model.key_phases()[:, 0]   # [M, phase_key_size, phase_key_size]
     phi = phi.cpu().numpy().reshape(M, -1)
 
     if M < 2:
@@ -271,7 +284,8 @@ def _save_mask_similarity(model, out_dir, dpi=200):
 def _save_phase_keys(model, out_dir, dpi=200):
     '''Grid of the learned phase-key masks, one per key (M total).'''
     with torch.no_grad():
-        masks = (torch.sigmoid(model.slm_phases) * 2 * np.pi).cpu()
+        # wrap into [0, 2pi): a footprint_only fine-tune leaves footprint phases in (-pi, pi)
+        masks = torch.remainder(model.key_phases(), 2 * np.pi).cpu()
     M = masks.shape[0]
 
     fig, axes = plt.subplots(1, M, figsize=(2.2 * M, 2.4), dpi=dpi, squeeze=False)
@@ -317,14 +331,17 @@ def _save_layer_masks(model, out_dir, dpi=200):
 
 def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
     '''
-    M rows x 3 columns, one row per phase key m:
+    M rows x 4 columns, one row per phase key m:
       col 1: learned phase key m
       col 2: intensity key m deposits on the encoding plane (cropped to the
              layer aperture, footprint of the encoding region outlined, mean
              footprint intensity vs. the unit
              incident intensity -- NOT a power fraction, since the key aperture
              fills the whole grid and most power is unmodulated background)
-      col 3: target vs. approximation using keys 0..m only (mean of the first
+      col 3: phase of key m's field at the encoding plane (same crop/outline,
+             wrapped to [0, 2pi); the key's field only, before the a-dependent
+             encoding phase is added)
+      col 4: target vs. approximation using keys 0..m only (mean of the first
              m+1 per-key detector readouts through the trained affine readout),
              for the median-error function of the FULL model, held fixed across
              rows. The last row reproduces the ordinary test result.
@@ -357,8 +374,10 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
 
     with torch.no_grad():
         f_cum = [criterion.normalize(I_all[:, :m + 1].mean(1).to(device)).cpu() for m in range(M)]
-        key_I = model.key_intensity_at_encoding().cpu().numpy()   # [M, N_sim, N_sim]
-        phases = (torch.sigmoid(model.slm_phases) * 2 * np.pi).cpu().numpy()[:, 0]
+        key_I, key_phi = model.key_intensity_at_encoding()       # [M, N_sim, N_sim] each
+        key_I = key_I.cpu().numpy()
+        key_phi = torch.remainder(key_phi, 2 * np.pi).cpu().numpy()   # angle() is (-pi, pi]; wrap to [0, 2pi)
+        phases = torch.remainder(model.key_phases(), 2 * np.pi).cpu().numpy()[:, 0]   # wrapped to [0, 2pi)
 
     rmse_cum = [FunctionApproxLoss.per_function_rmse(f, target) for f in f_cum]
     k = int(torch.argsort(rmse_cum[-1])[len(rmse_cum[-1]) // 2])
@@ -369,11 +388,16 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
     ly0 = (N - L) // 2
     ey0 = (N - E) // 2
 
-    fig, axes = plt.subplots(M, 3, figsize=(13, 3.2 * M), dpi=dpi, squeeze=False)
+    fig, axes = plt.subplots(M, 4, figsize=(19, 3.4 * M), dpi=dpi, squeeze=False)
     tgt = target[:, k].numpy(); a_np = a_all.numpy()
+    def phase_cbar(im, ax):
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+        cb.set_ticks([0, np.pi, 2 * np.pi]); cb.set_ticklabels(['0', 'π', '2π'])
+
     for m in range(M):
         ax = axes[m, 0]
-        ax.imshow(phases[m], cmap='twilight', vmin=0, vmax=2 * np.pi)
+        im = ax.imshow(phases[m], cmap='twilight', vmin=0, vmax=2 * np.pi)
+        phase_cbar(im, ax)
         ax.set_ylabel(f'key {m}', fontsize=11, fontweight='bold')
         ax.set_xticks([]); ax.set_yticks([])
         if m == 0:
@@ -383,15 +407,27 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
         I = key_I[m]
         enh = I[ey0:ey0 + E, ey0:ey0 + E].mean()   # incident (unit-amplitude) intensity == 1
         crop = I[ly0:ly0 + L, ly0:ly0 + L]
-        ax.imshow(crop, cmap='inferno')
+        # vmin=0: otherwise a uniform field (z=0: |exp(j*phi)|^2 == 1 everywhere) gets its
+        # ~1e-7 float rounding stretched over the whole colormap and looks like speckle
+        im = ax.imshow(crop, cmap='inferno', vmin=0, vmax=max(crop.max(), 1.0))
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03).set_label('× incident', fontsize=8)
         ax.add_patch(Rectangle((ey0 - ly0 - 0.5, ey0 - ly0 - 0.5), E, E,
                                 fill=False, edgecolor='cyan', linewidth=1.2))
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_xlabel(f'mean intensity in footprint = {enh:.1f}x incident', fontsize=9)
         if m == 0:
-            ax.set_title('Intensity at encoding plane (cyan = footprint)', fontsize=11, fontweight='bold')
+            ax.set_title('Intensity at encoding plane', fontsize=11, fontweight='bold')
 
         ax = axes[m, 2]
+        im = ax.imshow(key_phi[m][ly0:ly0 + L, ly0:ly0 + L], cmap='twilight', vmin=0, vmax=2 * np.pi)
+        phase_cbar(im, ax)
+        ax.add_patch(Rectangle((ey0 - ly0 - 0.5, ey0 - ly0 - 0.5), E, E,
+                                fill=False, edgecolor='cyan', linewidth=1.2))
+        ax.set_xticks([]); ax.set_yticks([])
+        if m == 0:
+            ax.set_title('Phase at encoding plane', fontsize=11, fontweight='bold')
+
+        ax = axes[m, 3]
         ax.plot(a_np, tgt, '-', color='black', label='target')
         ax.plot(a_np, f_cum[m][:, k].numpy(), '-.', color='tab:red', label='approx')
         ax.set_ylim(-0.05, 1.05)
@@ -406,11 +442,11 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
                         ha='center', va='bottom', fontsize=11, fontweight='bold')
 
     fig.suptitle(
-        'Phase-key evolution  (function shown: median-error f_%d of the full model)\n' % k +
+        'Phase-key evolution  (function shown: median-error f_%d of the full model; cyan box = encoding footprint)\n' % k +
         r'($N = r \cdot 2 N_p N_f$,  ' +
         f'r={config.r}  Np={config.Np}  Nf={config.Nf}  M={config.M}  K={config.num_layers})',
         fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.tight_layout(rect=[0, 0, 1, 0.97], w_pad=2.5, h_pad=2.0)
     path = os.path.join(out_dir, 'key_evolution.png')
     fig.savefig(path, bbox_inches='tight')
     plt.close(fig)
@@ -430,10 +466,19 @@ def _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse):
         'rmse_mean' : float(rmse.mean()),
         'rmse_max'  : float(rmse.max()),
         'rmse_min'  : float(rmse.min()),
+        'diff_eff_mean' : float(agg['de'].mean()) if 'de' in agg else float('nan'),
     }
     file_exists = os.path.exists(csv_path)
+    fieldnames = list(row.keys())
+    if file_exists:
+        # Appending to a CSV written before a column existed: keep ITS header so
+        # rows stay aligned (the extra column is dropped for that file only).
+        with open(csv_path, newline='') as f:
+            header = next(csv.reader(f), None)
+        if header:
+            fieldnames = header
     with open(csv_path, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
@@ -458,7 +503,9 @@ def _load_and_evaluate(ckpt_path):
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if 'config' in ckpt:
-        config.__dict__.update(ckpt['config'])
+        # every saved key is marked explicit, so recompute_derived() rebuilds
+        # exactly what was trained (never re-derives e.g. layer_size)
+        apply_saved_config(config, ckpt['config'])
         for k, v in saved_paths.items():
             if v is not None:
                 setattr(config, k, v)

@@ -4,8 +4,18 @@ Time-Multiplexed NFA — training (Nonlinear Function Approximation)
 Usage:
     python train.py
     python train.py --set freeze_slm=true
+    python train.py --set key_to_enc_spacing=0 key_train_region=footprint_only \
+        ckpt_to_load=<z0_masked run>/model/best.pth load_weights_only=true   # stage-2 footprint fine-tune
     python train.py --set M=5 lr_slm=5e-3
-    python train.py --set Nf=200 pd_num_rows=10 pd_num_cols=20
+    python train.py --set Np=25 Nf=1024 num_layers=3 M=2   # sizes follow automatically
+    python train.py --set Nf=200 pd_num_cols=20             # non-square Nf: give one side
+
+--set KEY=VALUE overrides any config.py value. Design values (layer_size,
+phase_key_size, N_trainable_features, pd_num_rows/cols) are re-derived from their
+formulas after the overrides are applied -- unless you --set them yourself, in
+which case your value sticks. The derived values are printed (and written to
+LOG.txt) at startup, tagged [set] or [derived]. See config.py "Derive unless you
+set it" and README.md.
 
 Logs are written to /logs/.
 Shared modules (dataloader, loss, wave_prop) are imported from the parent project.
@@ -35,7 +45,8 @@ import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 
-from config import init_params, recompute_derived, config_to_dict
+from config import (init_params, recompute_derived, config_to_dict, LEGACY_ALIASES,
+                    mark_explicit, describe_design)
 from model import TimeMultiplexedNFA
 from dataloader import get_function_approx_dataloaders
 from loss import FunctionApproxLoss
@@ -47,6 +58,9 @@ def _apply_overrides(config, overrides):
     '''Apply KEY=VALUE strings to config, preserving the original type.'''
     for kv in overrides:
         key, val_str = kv.split('=', 1)
+        if key in LEGACY_ALIASES:
+            print(f'  Note: --set {key} is a renamed key, using {LEGACY_ALIASES[key]}')
+            key = LEGACY_ALIASES[key]
         if not hasattr(config, key):
             raise ValueError(
                 f"--set {key}={val_str}: '{key}' is not a config attribute "
@@ -71,6 +85,7 @@ def _apply_overrides(config, overrides):
         else:
             val = val_str
         setattr(config, key, val)
+        mark_explicit(config, [key])   # never re-derived by recompute_derived()
         print(f'  Override: {key} = {val}')
 
 
@@ -101,8 +116,8 @@ class TimeMultiplexedNFATrainer:
         model = TimeMultiplexedNFA(self.config)
         model.to(self.device)
         print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
-        print(f'  Phase keys : {model.T} x {self.config.slm_x_num}^2'
-              f' = {model.T * self.config.slm_x_num ** 2:,} params')
+        print(f'  Phase keys : {model.T} x {self.config.phase_key_size}^2'
+              f' = {model.T * self.config.phase_key_size ** 2:,} params')
         print(f'  Layers     : {model.num_layers} x {self.config.layer_size}^2'
               f' = {model.num_layers * self.config.layer_size ** 2:,} params')
         return model
@@ -195,18 +210,24 @@ class TimeMultiplexedNFATrainer:
 
         Restores whatever train/eval mode the trainer was in before returning.
 
-        Returns (loss, per_function_rmse) -- per_function_rmse : [Nf] tensor.
+        Returns (loss, per_function_rmse, diffraction_efficiency) --
+        per_function_rmse : [Nf] tensor; diffraction_efficiency : float, mean
+        over all samples and phase keys (diagnostic only, see loss.py).
         '''
         was_training = self.is_training
         self._set_mode(False)
 
         all_a, all_fhat, all_target = [], [], []
         total_loss, n_batches = 0.0, 0
+        de_sum, de_count = 0.0, 0
+        incident = self.model.incident_energy()
         for a, target in loader:
             a = a.to(self.device); target = target.to(self.device)
             I_vec = self.model(a)
             loss, f_hat = self.criterion(I_vec, target)
             total_loss += loss.item(); n_batches += 1
+            de = self.criterion.diffraction_efficiency(I_vec, incident)   # [B, T]
+            de_sum += de.sum().item(); de_count += de.numel()
             all_a.append(a.cpu()); all_fhat.append(f_hat.cpu()); all_target.append(target.cpu())
 
         if was_training:
@@ -246,7 +267,7 @@ class TimeMultiplexedNFATrainer:
             fig.savefig(path, bbox_inches='tight')
             plt.close(fig)
 
-        return total_loss / max(n_batches, 1), rmse
+        return total_loss / max(n_batches, 1), rmse, de_sum / max(de_count, 1)
 
     # ---------------------------------------------------------------------- #
 
@@ -287,6 +308,19 @@ class TimeMultiplexedNFATrainer:
         self.model.load_state_dict(ckpt['model'], strict=False)
         if 'criterion' in ckpt and ckpt['criterion'] is not None:
             self.criterion.load_state_dict(ckpt['criterion'], strict=False)
+
+        # The trainable-key region follows THIS run's config, not the checkpoint's buffer.
+        # Loading a pinned-footprint checkpoint into a run that trains the footprint
+        # ('footprint_only' or 'all'): start the footprint at exactly its pinned phase 0
+        # rather than its untrained random init (see model.start_footprint_finetune).
+        ckpt_mask = ckpt['model'].get('key_train_mask')
+        was_pinned = ckpt_mask is not None and not bool(ckpt_mask.all())
+        self.model.reset_key_region()
+        if (was_pinned and self.model.key_train_region != 'outside_footprint'
+                and not self.model.key_phase_offset.any()):
+            self.model.start_footprint_finetune()
+            print(f'  key_train_region={self.model.key_train_region}: pinned footprint '
+                  f'from checkpoint starts at phase 0')
 
         # Weights-only: start a fresh fine-tune from the loaded weights, ignoring the
         # checkpoint's epoch / optimizer / scheduler (fresh cosine schedule from epoch 0).
@@ -340,7 +374,8 @@ class TimeMultiplexedNFATrainer:
         '''Grid of the learned phase-key masks, one per key (M total -- the
         time-multiplexed "wisdom of the crowd" ensembling axis).'''
         with torch.no_grad():
-            masks = (torch.sigmoid(self.model.slm_phases) * 2 * np.pi).cpu()
+            # wrap into [0, 2pi): a footprint_only fine-tune leaves footprint phases in (-pi, pi)
+            masks = torch.remainder(self.model.key_phases(), 2 * np.pi).cpu()
         M = masks.shape[0]
 
         fig, axes = plt.subplots(1, M, figsize=(2.2 * M, 2.4), dpi=200, squeeze=False)
@@ -438,6 +473,8 @@ def main():
 
     print('===> Training Start')
     print(f'Run Name: {config.run_name}')
+    print_and_save_msg('Design values ([set] = from --set, [derived] = from formula):\n'
+                       + describe_design(config) + '\n', log_file)
 
     for epoch in range(trainer.epoch, config.max_epoch):
         trainer.epoch = epoch
@@ -469,14 +506,16 @@ def main():
             print_and_save_msg(msg, log_file)
 
         if epoch % config.checkpoint_save == 0 or epoch == config.max_epoch - 1:
-            val_loss, rmse = trainer.evaluate(val_loader, tag='val', plot=False)
+            val_loss, rmse, val_de = trainer.evaluate(val_loader, tag='val', plot=False)
 
             writer.add_scalar('loss/val',      val_loss,           epoch)
             writer.add_scalar('rmse/val_mean', rmse.mean().item(), epoch)
             writer.add_scalar('rmse/val_max',  rmse.max().item(),  epoch)
+            writer.add_scalar('diffraction_efficiency/val', val_de, epoch)
 
             msg = (f'<epoch:{epoch:3d}> loss_val:{val_loss:.3e}  '
-                   f'rmse_mean:{rmse.mean().item():.3e}  rmse_max:{rmse.max().item():.3e}\n')
+                   f'rmse_mean:{rmse.mean().item():.3e}  rmse_max:{rmse.max().item():.3e}  '
+                   f'diff_eff:{val_de:.3e}\n')
             print_and_save_msg(msg, log_file)
 
             trainer.save()

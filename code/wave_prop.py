@@ -12,7 +12,7 @@ Zero-padding (config.asm_pad_factor > 1):
   asm_pad_factor = 2 doubles the grid before the FFT and crops it back
   afterwards, fully eliminating this circular artefact at the cost of
   ~4× memory and ~2× compute.  With asm_pad_factor = 1 the zero-margin
-  that already surrounds the SLM aperture (N_sim - slm_x_num) / 2 pixels
+  that already surrounds the SLM aperture (N_sim - phase_key_size) / 2 pixels
   on each side usually provides sufficient guard-band.
 '''
 

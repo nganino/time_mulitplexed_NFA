@@ -36,6 +36,10 @@ class FunctionApproxLoss(nn.Module):
             f'pd_num_rows * pd_num_cols ({self.rows * self.cols}) != config.Nf ({self.Nf})'
         )
 
+        # detector window side in sim pixels -- I_vec holds each detector's MEAN
+        # intensity over a pd_px x pd_px window (see diffraction_efficiency)
+        self.pd_px = int(getattr(config, 'photodiode_pixels', 1))
+
         self.loss_type = getattr(config, 'loss_type', 'mse')
         assert self.loss_type == 'mse', f"only 'mse' is implemented, got {self.loss_type!r}"
         self.mse_fn = nn.MSELoss()
@@ -82,6 +86,36 @@ class FunctionApproxLoss(nn.Module):
         f_hat = self.normalize(I_summed)                 # [B, Nf]
         loss = self.mse_fn(f_hat, target)
         return loss, f_hat
+
+    def diffraction_efficiency(self, I_vec, incident_energy):
+        '''
+        DIAGNOSTIC ONLY -- not part of the training loss (forward() never calls
+        it). Fraction of the energy incident on the phase-key plane that is
+        captured by the detector array, for each input sample and phase key.
+
+        I_vec           : [B, T, rows, cols] raw per-detector intensity
+                          (model.forward() output, BEFORE the learned scale/bias
+                          -- efficiency is a physical energy ratio, the affine
+                          readout is not part of it)
+        incident_energy : scalar, model.incident_energy()
+
+        Each I_vec entry is a detector's MEAN intensity over its pd_px x pd_px
+        window, so it is multiplied by pd_px^2 to get the energy that detector
+        captures -- otherwise efficiency would not be comparable across
+        detector sizes. Energy lost between detectors (dead space) is NOT
+        counted: this measures light usefully landing on detectors, not total
+        power surviving to the detector plane.
+
+        incident_energy is over the phase-key footprint only (see
+        model.incident_energy), so the ratio is independent of N_sim. It is
+        close to, but not strictly, bounded by 1: background plane-wave light
+        from outside the key footprint can diffract into the layer apertures.
+
+        returns [B, T] efficiency; average over both axes for a single number
+        (sum over detectors and mean over B/T commute).
+        '''
+        captured = I_vec.sum(dim=(-2, -1)) * self.pd_px ** 2   # [B, T]
+        return captured / incident_energy
 
     @staticmethod
     def per_function_rmse(f_hat, target):

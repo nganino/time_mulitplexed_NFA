@@ -44,12 +44,12 @@ class TimeMultiplexedNFA(nn.Module):
         # max fraction of per-sample std(I_vec). See _add_meas_noise / config.meas_noise_std.
         self.meas_noise_std = float(getattr(config, 'meas_noise_std', 0.0))
 
-        # SLM geometry
-        self.slm_x_num     = config.slm_x_num
-        self.slm_bin       = config.slm_bin
-        self.slm_x_num_sim = config.slm_x_num_sim
-        self.slm_hw_x      = getattr(config, 'slm_hw_x', config.slm_x_num)
-        self.slm_hw_y      = getattr(config, 'slm_hw_y', config.slm_x_num)
+        # Phase-key geometry (the key is displayed on the SLM, hence slm_dx/slm_hw_*)
+        self.phase_key_size     = config.phase_key_size
+        self.phase_key_bin      = config.phase_key_bin
+        self.phase_key_size_sim = config.phase_key_size_sim
+        self.slm_hw_x      = getattr(config, 'slm_hw_x', config.phase_key_size)
+        self.slm_hw_y      = getattr(config, 'slm_hw_y', config.phase_key_size)
 
         # Function-input encoding-plane geometry (deterministic, NOT learned --
         # see _encode_input). Replaces the old "object" (image) plane.
@@ -84,7 +84,7 @@ class TimeMultiplexedNFA(nn.Module):
         self.pd_centers_x = [cx0 + c * self.pd_col_spacing for c in range(self.pd_num_cols)]
 
         # Sanity checks
-        assert self.slm_x_num_sim <= self.N_sim
+        assert self.phase_key_size_sim <= self.N_sim
         assert self.encoding_x_num_sim <= self.N_sim
         half = self.pd_px // 2
         assert min(self.pd_centers_y) - half >= 0 and max(self.pd_centers_y) + half <= self.N_sim, \
@@ -93,14 +93,44 @@ class TimeMultiplexedNFA(nn.Module):
             'Photodiode array (cols) extends outside the simulation grid'
 
         # Learnable SLM phase masks (total masks = M * C == T)
-        slm_init = torch.zeros(self.T, 1, config.slm_x_num, config.slm_x_num)
+        slm_init = torch.zeros(self.T, 1, config.phase_key_size, config.phase_key_size)
         if config.mask_init_method == 'normal':
             std = getattr(config, 'mask_init_std', 0.5)
             nn.init.normal_(slm_init, mean=0.0, std=std)
         self.slm_phases = nn.Parameter(slm_init)
 
-        # Learnable diffractive layers (required -- the no-layers bypass case
-        # is no longer supported, see forward()).
+        # Which part of the phase keys trains (config.key_train_region):
+        #   'all'               : whole key.
+        #   'outside_footprint' : (or key_mask_encoder_footprint=True) the encoder footprint
+        #                          is pinned to zero phase 
+        #   'footprint_only'    : only the footprint trains; a gradient hook zeroes the
+        #                         gradient elsewhere (Adam then leaves those pixels untouched).
+        self.key_train_region = getattr(config, 'key_train_region', 'all')
+        if self.key_train_region == 'all' and bool(getattr(config, 'key_mask_encoder_footprint', False)):
+            self.key_train_region = 'outside_footprint'
+        assert self.key_train_region in ('all', 'outside_footprint', 'footprint_only'), \
+            f'unknown key_train_region {self.key_train_region!r}'
+
+        footprint = torch.zeros(1, 1, config.phase_key_size, config.phase_key_size)
+        if self.key_train_region != 'all':
+            assert self.phase_key_bin == 1, 'key_train_region != all requires phase_key_bin == 1'
+        if self.phase_key_bin == 1:
+            key_off = (self.N_sim - self.phase_key_size_sim) // 2      # same centering as _embed_in_sim
+            e0 = (self.N_sim - self.encoding_x_num_sim) // 2
+            e1 = e0 + self.encoding_x_num_sim
+            k0, k1 = max(e0 - key_off, 0), min(e1 - key_off, self.phase_key_size_sim)
+            footprint[..., k0:k1, k0:k1] = 1.0
+        self.register_buffer('key_footprint', footprint, persistent=False)
+        self.register_buffer('key_train_mask', self._region_mask())
+
+        # Constant phase subtracted in key_phases(). Zero except in a footprint_only
+        # fine-tune, where start_footprint_finetune() sets it to pi on the footprint.
+        self.register_buffer('key_phase_offset', torch.zeros_like(footprint))
+
+        if self.key_train_region == 'footprint_only':
+            self.slm_phases.register_hook(lambda g: g * self.key_footprint)
+
+        # Learnable diffractive layers
         self.num_layers      = getattr(config, 'num_layers', 0)
         assert self.num_layers > 0, 'TimeMultiplexedNFA requires num_layers > 0'
         self.layer_bin       = getattr(config, 'layer_bin', 1)
@@ -110,9 +140,9 @@ class TimeMultiplexedNFA(nn.Module):
         assert self.layer_size_sim <= self.N_sim, \
             'Diffractive layer extends outside the simulation grid'
 
-        # SLM aperture
-        ap_h = min(self.slm_hw_y * self.slm_bin, self.N_sim)
-        ap_w = min(self.slm_hw_x * self.slm_bin, self.N_sim)
+        # SLM aperture (current just an array full of ones)
+        ap_h = min(self.slm_hw_y * self.phase_key_bin, self.N_sim)
+        ap_w = min(self.slm_hw_x * self.phase_key_bin, self.N_sim)
         aperture = torch.zeros(1, 1, self.N_sim, self.N_sim)
         y0 = (self.N_sim - ap_h) // 2;  y1 = y0 + ap_h
         x0 = (self.N_sim - ap_w) // 2;  x1 = x0 + ap_w
@@ -149,9 +179,10 @@ class TimeMultiplexedNFA(nn.Module):
             enc_ap[..., ey0:ey1, ey0:ey1] = cell_mask
         self.register_buffer('encoding_aperture', enc_ap)
 
-        # Free-space propagators (key -> encoding plane, then through the
-        # diffractive layers to the detector -- no no-layers bypass anymore)
+        # Free-space propagators
         self.prop_key_to_enc = FreeSpaceProp(config, z=config.key_to_enc_spacing)
+        self.key_to_enc_exact = (float(config.key_to_enc_spacing) == 0.0
+                                 and bool(getattr(config, 'key_to_enc_exact_at_zero', True)))
         self.prop_to_layer1  = FreeSpaceProp(config, z=config.slm_first_layer_spacing)
         self.prop_interlayer = FreeSpaceProp(config, z=config.interlayer_spacing)
         self.prop_to_ccd     = FreeSpaceProp(config, z=config.last_layer_ccd_spacing)
@@ -159,6 +190,7 @@ class TimeMultiplexedNFA(nn.Module):
     # ---------------------------------------------------------------------- #
 
     def _embed_in_sim(self, x):
+        # zero pad all around x to reach N_sim x N_sim, keeps x centered
         h, w       = x.shape[-2], x.shape[-1]
         pad_h      = self.N_sim - h
         pad_w      = self.N_sim - w
@@ -168,55 +200,85 @@ class TimeMultiplexedNFA(nn.Module):
         pad_right  = pad_w - pad_left
         return F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
 
+    def key_phases(self):
+        return torch.sigmoid(self.slm_phases) * (2 * np.pi) * self.key_train_mask - self.key_phase_offset
+
+    def _region_mask(self):
+        # 0 where the key is pinned to phase 0 (only for 'outside_footprint'), else 1
+        if self.key_train_region == 'outside_footprint':
+            return 1.0 - self.key_footprint
+        return torch.ones_like(self.key_footprint)
+
+    def reset_key_region(self):
+        # Re-apply this config's region mask. Needed after loading a checkpoint from a
+        # different region (a stage-1 'outside_footprint' checkpoint carries a mask with
+        # the footprint zeroed, which would otherwise keep it pinned in stage 2).
+        self.key_train_mask.copy_(self._region_mask())
+
+    @torch.no_grad()
+    def start_footprint_finetune(self):
+        # Stage-2 start from an 'outside_footprint' checkpoint. The footprint was pinned to
+        # phase 0 there, but its raw slm_phases are still the untrained random init. Reset
+        # them to 0 (sigmoid(0)*2pi = pi, steepest point of the sigmoid) and subtract pi
+        # there, so the footprint starts at exactly phase 0 (the model at step 0 equals the
+        # stage-1 model) and trains over (-pi, pi). Outside the footprint nothing changes.
+        fp = self.key_footprint.expand_as(self.slm_phases).bool()
+        self.slm_phases[fp] = 0.0
+        self.key_phase_offset.copy_(np.pi * self.key_footprint)
+
     def _get_slm_field(self):
-        phi = torch.sigmoid(self.slm_phases) * (2 * np.pi)
-        if self.slm_bin != 1:
+        #embeds the M learned phase keys into sim grid, and performs binning if necessary
+        phi = self.key_phases()
+        if self.phase_key_bin != 1:
             phi = F.interpolate(
                 phi,
-                size=(self.slm_x_num_sim, self.slm_x_num_sim),
+                size=(self.phase_key_size_sim, self.phase_key_size_sim),
                 mode='nearest'
             )
         return self._embed_in_sim(phi)
 
+    def incident_energy(self):
+        #sums intensity over the size phase key footprint,
+        # with |Uin|=1, this returns phase_key_size_sim^2
+        footprint = self._embed_in_sim(self.slm_aperture.new_ones(
+            1, 1, self.phase_key_size_sim, self.phase_key_size_sim))
+        return (footprint * self.slm_aperture).sum()
+
     def key_intensity_at_encoding(self):
-        '''[T, N_sim, N_sim] intensity each phase key deposits on the encoding
-        plane. Input-independent (the encoding is phase-only), so no `a` needed.'''
+        #returns intensity distribution at the input encoding plane per phase key
+        # Returns tensor [T, N_sim, N_sim]
         U = self.slm_aperture * torch.exp(1j * self._get_slm_field())
-        return self.prop_key_to_enc(U)[:, 0].abs().pow(2)
+        return self._key_to_encoding(U)[:, 0].abs().pow(2), self._key_to_encoding(U)[:, 0].angle()
+
+    def _key_to_encoding(self, U_key):
+        # Propagate the phase_key to the input encoding plane.
+        # If z = 0, no propagator (copy key field to input plane) such that field at input plane is exactly exp(j*(phi_key + phi_encoding))
+        return U_key if self.key_to_enc_exact else self.prop_key_to_enc(U_key)
 
     def _encode_input(self, a):
-        '''
-        Deterministic function-input encoding (NOT learned) -- PAPER Sec.
-        2.2/4.1: phi_in(p;a) = 2*pi*alpha_p*a, alpha_p = (p-1)*encoding_freq_step,
-        over an encoding_side x encoding_side square patch of Np pixels
-        (row-major: p - 1 = row*encoding_side + col). If encoding_gap_blocks > 0,
-        blank bin-sized blocks are interleaved between adjacent pixels (both
-        rows and columns) -- see encoding_aperture (built in __init__) for the
-        matching transparent/opaque treatment of those gap blocks.
-
-        a : [B] real tensor of scalar input values.
-        returns phi_in_sim : [B, 1, N_sim, N_sim] real phase field (radians),
-        zero everywhere outside the Np-pixel encoding patch (and in any gap
-        blocks within it).
-        '''
+        # for a given a, computes [2pi(0)a, 2pi(1)a, ..., 2pi(Np-1)a] and transforms into 2d block of size encoding_side x encoding_side
+        # if gap != 0, inserts zeros between blocks
+        # embeds encoding block into sim, and performs binning if necessary
         B = a.shape[0]
         side = self.encoding_side
         gap  = self.encoding_gap_blocks
         p_idx = torch.arange(side * side, device=a.device, dtype=a.dtype)
         alphas = p_idx * self.encoding_freq_step                     # [Np]
-        phi_flat = 2 * np.pi * torch.einsum('b,p->bp', a, alphas)    # [B, Np]
-        phi_px = phi_flat.view(B, side, side) # B is the number of a samples (batch size)
+        phi_flat = 2 * np.pi * torch.einsum('b,p->bp', a, alphas)    # outer product--[B, Np], for a given a:[2pi(0)a, 2pi(1)a, ..., 2pi(Np-1)a]
+        phi_px = phi_flat.view(B, side, side) # B is the number of a samples (batch size), transforms 1d flat grid into 2d grid of size side x side
 
         if gap > 0:
-            cell_side = side + (side - 1) * gap
-            cell_phi = phi_px.new_zeros(B, cell_side, cell_side)
-            idx = torch.arange(side, device=a.device) * (1 + gap)
-            cell_phi[:, idx[:, None], idx[None, :]] = phi_px
+            cell_side = side + (side - 1) * gap # size of new block with inserted zeros
+            cell_phi = phi_px.new_zeros(B, cell_side, cell_side) 
+            idx = torch.arange(side, device=a.device) * (1 + gap) # where to place real pixels
+            cell_phi[:, idx[:, None], idx[None, :]] = phi_px # inserts real pixels in the zero array, leaving zeros in between
         else:
             cell_phi = phi_px
         phi_patch = cell_phi.unsqueeze(1)                             # [B, 1, cell_side, cell_side]
 
-        if self.encoding_bin != 1:
+        # encoding bin is directly related to the encoding_patch_scale
+        # non unity encoding_bin also scales gap sizes
+        if self.encoding_bin != 1: 
             phi_patch = F.interpolate(
                 phi_patch,
                 size=(self.encoding_x_num_sim, self.encoding_x_num_sim),
@@ -225,6 +287,7 @@ class TimeMultiplexedNFA(nn.Module):
         return self._embed_in_sim(phi_patch)
 
     def _get_layer_phase(self, k):
+        # returns kth layer's phase, embeds in sim with binning if necessary
         phi = torch.sigmoid(self.layer_phases[k:k+1]) * (2 * np.pi)   # [1, 1, layer_size, layer_size]
         if self.layer_bin != 1:
             phi = F.interpolate(
@@ -235,12 +298,10 @@ class TimeMultiplexedNFA(nn.Module):
         return self._embed_in_sim(phi)                                 # [1, 1, N_sim, N_sim]
 
     def _integrate_photodiode_array(self, I_ccd):
-        '''
-        Mean intensity captured by each detector in the pd_num_rows x pd_num_cols array.
-
-        I_ccd : [B, T, N_sim, N_sim]
-        returns [B, T, pd_num_rows, pd_num_cols]
-        '''
+        # Using pre computed detector center locations, averages intensity over each detector's pd_px x pd_px footprint
+        #I_ccd : [B, T, N_sim, N_sim] raw sensor plane intensity
+        #returns [B, T, pd_num_rows, pd_num_cols]
+        
         half = self.pd_px // 2
         rows = []
         for cy in self.pd_centers_y:
@@ -253,14 +314,9 @@ class TimeMultiplexedNFA(nn.Module):
         return torch.stack(rows, dim=-2)                     # [B, M, pd_num_rows, pd_num_cols]
 
     def _add_meas_noise(self, I_vec):
-        """Additive measurement noise for noise-robust end-to-end training.
-
-        Draws a per-sample noise level uniformly from [0, meas_noise_std], then adds Gaussian
-        noise with std = level * per-sample std(I_vec). Only active in training mode
-        (model.train()); measurement/eval passes stay clean. No multiplicative jitter — additive
-        measurement noise only. Set config.meas_noise_std to a chosen maximum, or to the estimate
-        printed by experimental_decoder.ipynb (NOISE_ADD, ~0.2).
-        """
+        #Adds gaussian noise to each pixel of the photodiode array
+        # st. deviation given by self.meas_noise_std * std(I_vec) per sample
+        
         if self.training and self.meas_noise_std > 0:
             B    = I_vec.shape[0]
             flat = I_vec.reshape(B, -1)                     # per-sample std over all M x rows x cols
@@ -275,25 +331,22 @@ class TimeMultiplexedNFA(nn.Module):
     def forward(self, a, return_field=False):
         '''
         a : [B] real tensor of scalar function-input values.
-
-        Returns the raw per-detector measurement array — there is no decoder /
-        readout head here. See loss.py for how I_vec is summed over the M
-        phase-key axis, normalized, and turned into f_hat(a).
-
-        I_vec : [B, T, pd_num_rows, pd_num_cols]  (T == M, no more countries)
+        Returns I_vec : [B, T, pd_num_rows, pd_num_cols]  (T == M, no more countries)
         '''
         B = a.shape[0]
-        phi_in_sim  = self._encode_input(a)
-        phi_slm_sim = self._get_slm_field()
+        phi_in_sim  = self._encode_input(a) # encoding plane phases [B, 1, N_sim, N_sim]
+        phi_slm_sim = self._get_slm_field() # key plane phases [M, 1, N_sim, N_sim]
 
         # Phase-key plane -> input plane
-        U_slm        = self.slm_aperture * torch.exp(1j * phi_slm_sim) # [T, 1, N_sim, N_sim]
-        U_at_enc     = self.prop_key_to_enc(U_slm) # [T, 1, N_sim, N_sim]
+        U_key        = self.slm_aperture * torch.exp(1j * phi_slm_sim) # [T, 1, N_sim, N_sim]
+        U_at_enc     = self._key_to_encoding(U_key) # [T, 1, N_sim, N_sim] either propagated or copied (z=0) to the input plane
         U_at_enc_exp = U_at_enc[:, 0, :, :].unsqueeze(0) # [1, T, N_sim, N_sim]
+
         # Input plane perturbation
         U_input = self.encoding_aperture * torch.exp(1j * phi_in_sim)  # [B, 1, N_sim, N_sim]
         U_input_exp = U_input.expand(-1, self.T, -1, -1) # [B, T, N_sim, N_sim]
         U_flat = (U_at_enc_exp * U_input_exp).reshape(B * self.T, 1, self.N_sim, self.N_sim)
+
         # Diffractive layers -> detector plane
         field = self.prop_to_layer1(U_flat)
         for k in range(self.num_layers):
