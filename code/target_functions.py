@@ -9,8 +9,9 @@ following Rahman et al., eLight (2025) 5:32, Sec. 4.1 / Eq. 10:
 where:
   - F_k(alpha_i) are complex Fourier coefficients, modulus ~ Uniform(0,1) and
     phase ~ Uniform(0, 2*pi) (PAPER, Eq. 10's surrounding text).
-  - alpha_i = (i-1) * encoding_freq_step for i = 1..Nalpha, Nalpha == Np
-    (PAPER, Sec. 4.1: "We set Nalpha = Np and alpha_i = (i-1)").
+  - alpha_i = (i-1) * encoding_freq_step for i = 1..Nalpha. Nalpha == Np in
+    encoding_mode='constant' (PAPER, Sec. 4.1: "We set Nalpha = Np and alpha_i = (i-1)"),
+    Nalpha == Np*M in encoding_mode='split' (see config.recompute_derived).
   - A single min-max normalization is applied JOINTLY across all Nf functions
     (not per-function) so the global min/max over (k, a) becomes 0/1 (PAPER,
     Sec. 4.1's normalization step, restated for Eq. 10's already-squared form).
@@ -38,7 +39,7 @@ class TargetFunctionSet:
 
     def __init__(self, config):
         self.Nf       = int(config.Nf)
-        self.N_alpha  = int(config.N_alpha)   # number of harmonics == Np, see config.recompute_derived
+        self.N_alpha  = int(config.N_alpha)   # number of harmonics (Np, or Np*M in split mode), see config.recompute_derived
         self.freq_step = float(getattr(config, 'encoding_freq_step', 1))
 
         # alpha_i = (i-1) * freq_step, i = 1..N_alpha  (PAPER Sec. 4.1)

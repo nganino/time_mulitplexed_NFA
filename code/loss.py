@@ -106,10 +106,12 @@ class FunctionApproxLoss(nn.Module):
         counted: this measures light usefully landing on detectors, not total
         power surviving to the detector plane.
 
-        incident_energy is over the phase-key footprint only (see
-        model.incident_energy), so the ratio is independent of N_sim. It is
-        close to, but not strictly, bounded by 1: background plane-wave light
-        from outside the key footprint can diffract into the layer apertures.
+        incident_energy is over the larger of the phase-key and first-layer
+        footprints (see model.incident_energy), so the ratio is independent of
+        N_sim. It is close to, but not strictly, bounded by 1: a little plane-wave
+        light from outside that footprint can still diffract into the layer
+        apertures. (Before 2026-10-07 it was the key footprint only, which gave
+        values > 1 when the key was smaller than the layers.)
 
         returns [B, T] efficiency; average over both axes for a single number
         (sum over detectors and mean over B/T commute).

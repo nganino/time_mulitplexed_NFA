@@ -4,11 +4,10 @@ Time-Multiplexed NFA — training (Nonlinear Function Approximation)
 Usage:
     python train.py
     python train.py --set freeze_slm=true
-    python train.py --set key_to_enc_spacing=0 key_train_region=footprint_only \
-        ckpt_to_load=<z0_masked run>/model/best.pth load_weights_only=true   # stage-2 footprint fine-tune
     python train.py --set M=5 lr_slm=5e-3
     python train.py --set Np=25 Nf=1024 num_layers=3 M=2   # sizes follow automatically
     python train.py --set Nf=200 pd_num_cols=20             # non-square Nf: give one side
+    python train.py --set encoding_mode=split Np=9 M=4      # 36 harmonics, 9 per frame
 
 --set KEY=VALUE overrides any config.py value. Design values (layer_size,
 phase_key_size, N_trainable_features, pd_num_rows/cols) are re-derived from their
@@ -309,19 +308,6 @@ class TimeMultiplexedNFATrainer:
         if 'criterion' in ckpt and ckpt['criterion'] is not None:
             self.criterion.load_state_dict(ckpt['criterion'], strict=False)
 
-        # The trainable-key region follows THIS run's config, not the checkpoint's buffer.
-        # Loading a pinned-footprint checkpoint into a run that trains the footprint
-        # ('footprint_only' or 'all'): start the footprint at exactly its pinned phase 0
-        # rather than its untrained random init (see model.start_footprint_finetune).
-        ckpt_mask = ckpt['model'].get('key_train_mask')
-        was_pinned = ckpt_mask is not None and not bool(ckpt_mask.all())
-        self.model.reset_key_region()
-        if (was_pinned and self.model.key_train_region != 'outside_footprint'
-                and not self.model.key_phase_offset.any()):
-            self.model.start_footprint_finetune()
-            print(f'  key_train_region={self.model.key_train_region}: pinned footprint '
-                  f'from checkpoint starts at phase 0')
-
         # Weights-only: start a fresh fine-tune from the loaded weights, ignoring the
         # checkpoint's epoch / optimizer / scheduler (fresh cosine schedule from epoch 0).
         if bool(getattr(self.config, 'load_weights_only', False)):
@@ -374,8 +360,7 @@ class TimeMultiplexedNFATrainer:
         '''Grid of the learned phase-key masks, one per key (M total -- the
         time-multiplexed "wisdom of the crowd" ensembling axis).'''
         with torch.no_grad():
-            # wrap into [0, 2pi): a footprint_only fine-tune leaves footprint phases in (-pi, pi)
-            masks = torch.remainder(self.model.key_phases(), 2 * np.pi).cpu()
+            masks = self.model.key_phases().cpu()                 # already in [0, 2pi)
         M = masks.shape[0]
 
         fig, axes = plt.subplots(1, M, figsize=(2.2 * M, 2.4), dpi=200, squeeze=False)

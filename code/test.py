@@ -7,11 +7,14 @@ Usage:
 
 Outputs saved to <out_dir>/:
     test_summary.png            — combined summary figure (see _save_test_summary):
-                                   error-distribution histogram (top-left), spatial
-                                   RMSE heatmap over the detector plane (top-right),
+                                   error-distribution histogram (top-left), input
+                                   encoding-plane phase with sim-pixel grid (top-middle),
+                                   per-detector RMSE map (top-right),
                                    and target-vs-approx curves for representative
                                    functions -- best-fit / worst-fit / mid-error
                                    (bottom row, paper Fig. 2a/2b/2c-style)
+    plane_layout.png            — phase key 0 | encoding plane | layer 1 | detector-array
+                                   extent, each on the full sim grid (relative sizes)
     phase_keys_final.png        — learned phase-key masks (one per key, M total)
     layer_masks_final.png       — learned diffractive-layer phase masks
     phase_key_similarity.png    — pairwise phase similarity between the M keys
@@ -123,15 +126,28 @@ def _print_summary(agg, tag='Test'):
 
 # ──────────────────────────── save figures ────────────────────────────────── #
 
-def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
+def _enc_tag(config):
+    '''Np / N_alpha / mode text for figure titles.'''
+    if getattr(config, 'encoding_mode', 'constant') == 'split':
+        return (f'Np={config.Np}/frame  N_alpha={config.N_alpha} (split, '
+                f'{getattr(config, "split_patch", "frame")})')
+    return f'Np={config.Np}'
+
+
+def _encoding_boxes(model):
+    '''(row0, col0, height, width) in sim px of every encoding patch copy (one for 'single').'''
+    h, w, N = model.encoding_y_num_sim, model.encoding_x_num_sim, model.N_sim
+    y0, x0 = (N - h) // 2, (N - w) // 2                       # centred patch, as _embed_in_sim
+    return [(y0 + dy, x0 + dx, h, w) for dy, dx in model.encoding_tile_shifts]
+
+
+def _save_test_summary(agg, rmse, config, model, save_path, n_show=4, dpi=200, enc_a=0.3):
     '''
     Combined test-summary figure -- one PNG instead of separate files:
       - top-left:   histogram of per-function RMSE (paper Fig. 2a-style)
-      - top-middle: RMSE vs. each function's target dynamic range (max-min
-        over the domain) -- a simple difficulty/complexity proxy, testing
-        whether more-oscillatory/higher-range functions are the ones fit
-        worst. The same best/middle/worst functions highlighted in the
-        bottom row are marked here too, tying the two panels together.
+      - top-middle: input encoding-plane phase at a = enc_a, zoomed on the
+        encoding patch with the sim-pixel grid overlaid (title carries the
+        input bin / gap settings)
       - top-right:  spatial map of per-function RMSE over the detector plane
       - bottom row (full width): target-vs-approx curves for representative
         functions -- best-fit, worst-fit, and two spread across the middle
@@ -163,8 +179,8 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
 
     # ncols = 3*n_show divides evenly by n_show (bottom row's equal columns);
     # the top row instead splits unevenly -- histogram gets back close to the
-    # ~half-width it had before this panel existed, the complexity scatter
-    # (simple, doesn't need much width) gets the least, heatmap gets the rest
+    # ~half-width it had before this panel existed, the (square) input-plane
+    # image gets the least, heatmap gets the rest
     # (it needs room for its colorbar without feeling squeezed).
     ncols = 3 * n_show
     hist_w = ncols * 5 // 12
@@ -182,34 +198,51 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
     ax_hist.set_title(f'Error distribution (Nf={len(rmse_np)})', fontsize=10)
     ax_hist.legend(fontsize=8)
 
-    # ---- top-middle: RMSE vs. target dynamic range (difficulty proxy) -------
-    ax_cx = fig.add_subplot(gs[0, hist_w:hist_w + cx_w])
-    target_range = target.max(axis=0) - target.min(axis=0)   # [Nf], each in [0,1]
-    ax_cx.scatter(target_range, rmse_np, s=14, alpha=0.5, color='steelblue', label='_nolegend_')
-    _rank_colors = {'best': 'tab:green', 'middle': 'tab:orange', 'worst': 'tab:red'}
-    _seen_labels = set()
-    for k, lab in label_of.items():
-        ax_cx.scatter(target_range[k], rmse_np[k], s=45, marker='*',
-                       color=_rank_colors[lab], edgecolors='black', linewidths=0.5,
-                       label=(lab if lab not in _seen_labels else '_nolegend_'))
-        _seen_labels.add(lab)
-    ax_cx.set_yscale('log')
-    ax_cx.set_xlabel('target dynamic range (max - min over a)')
-    ax_cx.set_ylabel('RMSE')
-    ax_cx.set_title('Error vs. target complexity', fontsize=10)
-    ax_cx.legend(fontsize=7)
+    # ---- top-middle: input encoding plane (phase), zoomed on the patch -------
+    # Same view as the logs/sanity_checks encoding figures: crop = patch + a small
+    # margin, green grid = sim pixels, cyan box = encoding patch. Opaque (blocked)
+    # pixels are drawn black.
+    ax_enc = fig.add_subplot(gs[0, hist_w:hist_w + cx_w])
+    with torch.no_grad():
+        a_show = torch.tensor([enc_a], device=model.encoding_aperture.device)
+        U = model.encoding_aperture * torch.exp(1j * model._encode_input(a_show))
+    N, margin = config.N_sim, 4
+    Ph, Pw = model.encoding_y_num_sim, model.encoding_x_num_sim  # one patch copy, sim px
+    X = model.encoding_extent_sim                              # all patch copies
+    W = X + 2 * margin
+    c0 = (N - X) // 2 - margin
+    phase = np.mod(torch.angle(U)[0, 0].cpu().numpy(), 2 * np.pi)[c0:c0 + W, c0:c0 + W]
+    amp = U.abs()[0, 0].cpu().numpy()[c0:c0 + W, c0:c0 + W]
+    cmap = plt.get_cmap('twilight').copy(); cmap.set_bad('black')
+    im_enc = ax_enc.imshow(np.ma.masked_where(amp == 0, phase), cmap=cmap, vmin=0,
+                           vmax=2 * np.pi, interpolation='nearest')
+    ax_enc.set_xticks(np.arange(-0.5, W, 1), minor=True); ax_enc.set_yticks(np.arange(-0.5, W, 1), minor=True)
+    ax_enc.grid(which='minor', color='lime', linewidth=0.3, alpha=0.7)
+    ax_enc.tick_params(which='both', length=0); ax_enc.set_xticks([]); ax_enc.set_yticks([])
+    for r0, q0, h, w in _encoding_boxes(model):               # cyan box per patch copy
+        ax_enc.add_patch(Rectangle((q0 - c0 - 0.5, r0 - c0 - 0.5), w, h, fill=False,
+                                   edgecolor='cyan', linewidth=1.2))
+    ax_enc.set_title(f'Input plane phase (bin = {config.encoding_patch_scale}, '
+                     f'gap = {config.encoding_gap_blocks})\n'
+                     f'a = {enc_a}, patch {Ph}x{Pw} sim px, tiles {model.encoding_tile_pattern}'
+                     f'{", frame 0" if model.encoding_mode == "split" else ""}',
+                     fontsize=9)
+    cb_enc = fig.colorbar(im_enc, ax=ax_enc, fraction=0.046, pad=0.03)
+    cb_enc.set_ticks([0, np.pi, 2 * np.pi]); cb_enc.set_ticklabels(['0', 'π', '2π'])
 
     # ---- top-right: spatial error heatmap -----------------------------------
     # Detector (r, c) reads function k = r*pd_num_cols + c (matches model.py's
     # _integrate_photodiode_array), so the RMSE vector reshapes straight into
     # that grid. The dead space between detectors is collapsed: each detector
     # is one equal-size block colored by its own RMSE (no interpolation), so
-    # this is a table of detectors, not a physical-scale map.
+    # this is a table of detectors, not a physical-scale map. origin='upper' (row 0 at the
+    # top), same orientation as the input-plane panel, so low sim-grid indices are top-left
+    # in both (was origin='lower' before 2026-10-08, which flipped this panel vertically).
     ax_heat = fig.add_subplot(gs[0, hist_w + cx_w:])
     rows, cols = config.pd_num_rows, config.pd_num_cols
     grid = rmse_np.reshape(rows, cols)   # row-major k = r*cols + c, matches model.py
 
-    im = ax_heat.imshow(grid, cmap='hot', origin='lower', interpolation='nearest',
+    im = ax_heat.imshow(grid, cmap='hot', origin='upper', interpolation='nearest',
                          aspect='equal')
     ax_heat.set_xlabel(f'detector column (CtoC spacing {config.pd_col_spacing_px} px)')
     ax_heat.set_ylabel(f'detector row (CtoC spacing {config.pd_row_spacing_px} px)')
@@ -233,7 +266,7 @@ def _save_test_summary(agg, rmse, config, save_path, n_show=4, dpi=200):
         if i == 0:
             ax.legend(fontsize=7)
 
-    fig.suptitle(f'Test summary   mean RMSE={rmse.mean():.2e}   max RMSE={rmse.max():.2e}\nr={config.r}  Np={config.Np}  Nf={config.Nf}  M={config.M}  K={config.num_layers}', fontsize=10)
+    fig.suptitle(f'Test summary   mean RMSE={rmse.mean():.2e}   max RMSE={rmse.max():.2e}\nr={config.r}  {_enc_tag(config)}  Nf={config.Nf}  M={config.M}  K={config.num_layers}\ninput plane opaque background = {config.encoding_opaque_background} key_to_input_dist = {config.key_to_enc_spacing} key_size = {config.phase_key_size}', fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(save_path, bbox_inches='tight')
     plt.close(fig)
@@ -281,11 +314,104 @@ def _save_mask_similarity(model, out_dir, dpi=200):
     return sim
 
 
+def _save_encoding_frames(model, config, out_dir, dpi=200, enc_a=0.3):
+    '''Split mode only: input-plane phase of every frame (key) at a = enc_a, zoomed on the
+    encoding extent, cyan box per patch copy. Saved as encoding_frames.png.'''
+    if model.encoding_mode != 'split':
+        return
+    with torch.no_grad():
+        a_show = torch.tensor([enc_a], device=model.encoding_aperture.device)
+        U = model.encoding_aperture * torch.exp(1j * model._encode_input(a_show))   # [1, M, N, N]
+    N, X, margin = config.N_sim, model.encoding_extent_sim, 4
+    W = X + 2 * margin
+    c0 = (N - X) // 2 - margin
+    cmap = plt.get_cmap('twilight').copy(); cmap.set_bad('black')
+    M = model.M
+    fig, axes = plt.subplots(1, M, figsize=(3.4 * M, 3.8), dpi=dpi, squeeze=False)
+    for m in range(M):
+        ax = axes[0, m]
+        phase = np.mod(torch.angle(U)[0, m].cpu().numpy(), 2 * np.pi)[c0:c0 + W, c0:c0 + W]
+        amp = U.abs()[0, m].cpu().numpy()[c0:c0 + W, c0:c0 + W]
+        im = ax.imshow(np.ma.masked_where(amp == 0, phase), cmap=cmap, vmin=0, vmax=2 * np.pi,
+                       interpolation='nearest')
+        for r0, q0, h, w in _encoding_boxes(model):
+            ax.add_patch(Rectangle((q0 - c0 - 0.5, r0 - c0 - 0.5), w, h, fill=False,
+                                   edgecolor='cyan', linewidth=1.0))
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f'key {m}: harmonics {m * model.Np}..{(m + 1) * model.Np - 1}', fontsize=9)
+    cb = fig.colorbar(im, ax=axes[0].tolist(), fraction=0.02, pad=0.01)
+    cb.set_ticks([0, np.pi, 2 * np.pi]); cb.set_ticklabels(['0', 'π', '2π'])
+    fig.suptitle(f'Input plane per frame (split), a = {enc_a}   {_enc_tag(config)}  '
+                 f'bin {config.encoding_patch_scale}, gap {config.encoding_gap_blocks}, '
+                 f'tiles {model.encoding_tile_pattern}', fontsize=10)
+    path = os.path.join(out_dir, 'encoding_frames.png')
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Encoding frames saved → {path}')
+
+
+def _save_plane_layout(model, config, out_dir, dpi=200, enc_a=0.3):
+    '''
+    One row, every panel the full N_sim x N_sim grid, so the planes' relative sizes are
+    directly comparable: phase key 0 | encoding plane (a = enc_a, cyan border = encoding
+    patch) | diffractive layer 1 | detector plane (cyan border = extent of the detector
+    array). Phases wrapped to [0, 2pi); blocked (zero-amplitude) pixels are black -- e.g.
+    everything outside the layer aperture. Outside the key the key plane is lit at phase 0.
+    '''
+    N, dx_um = config.N_sim, config.sim_dx * 1e6
+    cmap = plt.get_cmap('twilight').copy(); cmap.set_bad('black')
+    with torch.no_grad():
+        dev = model.slm_aperture.device
+        key = torch.remainder(model._get_slm_field()[0, 0], 2 * np.pi)
+        key = np.ma.masked_where((model.slm_aperture[0, 0] == 0).cpu().numpy(), key.cpu().numpy())
+        U = model.encoding_aperture * torch.exp(1j * model._encode_input(torch.tensor([enc_a], device=dev)))
+        enc = np.ma.masked_where((U.abs()[0, 0] == 0).cpu().numpy(),
+                                 torch.remainder(torch.angle(U)[0, 0], 2 * np.pi).cpu().numpy())
+        lay = (torch.remainder(model._get_layer_phase(0)[0, 0], 2 * np.pi)).cpu().numpy()
+        lay = np.ma.masked_where((model.layer_aperture[0, 0] == 0).cpu().numpy(), lay)
+
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4.6), dpi=dpi)
+    Ph, Pw = config.encoding_y_num_sim, config.encoding_x_num_sim
+    L, Kk = config.layer_size_sim, config.phase_key_size_sim
+    panels = [(key, f'Phase key 0  ({Kk} px = {Kk * dx_um:.1f} µm)'),
+              (enc, f'Encoding plane, a = {enc_a}  (patch {Ph}x{Pw} px = {Ph * dx_um:.1f}x{Pw * dx_um:.1f} µm,\n'
+                    f'bin {config.encoding_patch_scale}, gap {config.encoding_gap_blocks}, '
+                    f'tiles {model.encoding_tile_pattern}, background {"opaque" if config.encoding_opaque_background else "transparent"})'),
+              (lay, f'Diffractive layer 1  ({L} px = {L * dx_um:.1f} µm)')]
+    im = None
+    for ax, (img, title) in zip(axes[:3], panels):
+        im = ax.imshow(img, cmap=cmap, vmin=0, vmax=2 * np.pi, interpolation='nearest')
+        ax.set_title(title, fontsize=9)
+    for r0, q0, h, w in _encoding_boxes(model):               # cyan box per patch copy
+        axes[1].add_patch(Rectangle((q0 - 0.5, r0 - 0.5), w, h, fill=False, edgecolor='cyan', linewidth=1.2))
+
+    # detector plane: grey canvas, border around the array (outermost detector pixel edges)
+    ax = axes[3]
+    ax.imshow(np.zeros((N, N)), cmap='gray', vmin=0, vmax=1, interpolation='nearest')
+    r0, r1 = int(model.pd_rows_idx.min()), int(model.pd_rows_idx.max())
+    c0, c1 = int(model.pd_cols_idx.min()), int(model.pd_cols_idx.max())
+    ax.add_patch(Rectangle((c0 - 0.5, r0 - 0.5), c1 - c0 + 1, r1 - r0 + 1, fill=False, edgecolor='cyan', linewidth=1.2))
+    ax.set_title(f'Detector plane  ({config.pd_num_rows} x {config.pd_num_cols} detectors, '
+                 f'pdsize = {config.photodiode_pixels} px, pd_spacing = {config.pd_row_spacing_px} px ,\n'
+                 f'array {r1 - r0 + 1} px = {(r1 - r0 + 1) * dx_um:.1f} µm)', fontsize=9)
+    for ax in axes:
+        ax.set_xlim(-0.5, N - 0.5); ax.set_ylim(N - 0.5, -0.5)
+        ax.set_xticks([0, N // 2, N - 1]); ax.set_yticks([0, N // 2, N - 1]); ax.tick_params(labelsize=7)
+    cbar = fig.colorbar(im, ax=axes[:3], fraction=0.015, pad=0.01)
+    cbar.set_ticks([0, np.pi, 2 * np.pi]); cbar.set_ticklabels(['0', 'π', '2π'])
+    fig.suptitle(f'Plane layout on the {N} x {N} sim grid ({N * dx_um:.1f} µm; 1 px = {dx_um * 1e3:.0f} nm)   '
+                 f'{_enc_tag(config)}  Nf={config.Nf}  K={config.num_layers}  M={config.M}'
+                 f'{"  (encoding plane: frame 0)" if model.encoding_mode == "split" else ""}', fontsize=10)
+    path = os.path.join(out_dir, 'plane_layout.png')
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Plane layout saved → {path}')
+
+
 def _save_phase_keys(model, out_dir, dpi=200):
     '''Grid of the learned phase-key masks, one per key (M total).'''
     with torch.no_grad():
-        # wrap into [0, 2pi): a footprint_only fine-tune leaves footprint phases in (-pi, pi)
-        masks = torch.remainder(model.key_phases(), 2 * np.pi).cpu()
+        masks = model.key_phases().cpu()                          # already in [0, 2pi)
     M = masks.shape[0]
 
     fig, axes = plt.subplots(1, M, figsize=(2.2 * M, 2.4), dpi=dpi, squeeze=False)
@@ -333,14 +459,15 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
     '''
     M rows x 4 columns, one row per phase key m:
       col 1: learned phase key m
-      col 2: intensity key m deposits on the encoding plane (cropped to the
+      col 2: intensity key m deposits on the encoding plane, times the encoding
+             aperture (an opaque background is shown dark), cropped to the
              layer aperture, footprint of the encoding region outlined, mean
-             footprint intensity vs. the unit
+             intensity over the footprint's OPEN pixels vs. the unit
              incident intensity -- NOT a power fraction, since the key aperture
              fills the whole grid and most power is unmodulated background)
       col 3: phase of key m's field at the encoding plane (same crop/outline,
-             wrapped to [0, 2pi); the key's field only, before the a-dependent
-             encoding phase is added)
+             wrapped to [0, 2pi), black where the aperture blocks the light;
+             the key's field only, before the a-dependent encoding phase is added)
       col 4: target vs. approximation using keys 0..m only (mean of the first
              m+1 per-key detector readouts through the trained affine readout),
              for the median-error function of the FULL model, held fixed across
@@ -375,8 +502,13 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
     with torch.no_grad():
         f_cum = [criterion.normalize(I_all[:, :m + 1].mean(1).to(device)).cpu() for m in range(M)]
         key_I, key_phi = model.key_intensity_at_encoding()       # [M, N_sim, N_sim] each
-        key_I = key_I.cpu().numpy()
-        key_phi = torch.remainder(key_phi, 2 * np.pi).cpu().numpy()   # angle() is (-pi, pi]; wrap to [0, 2pi)
+        # what actually leaves the encoding plane: an opaque background blocks everything
+        # outside the encoding pixels (transparent: aperture is all ones, no change)
+        enc_ap = model.encoding_aperture[0, 0]                   # [N_sim, N_sim], 0/1
+        key_I = (key_I * enc_ap).cpu().numpy()
+        key_phi = torch.remainder(key_phi, 2 * np.pi)   # angle() is (-pi, pi]; wrap to [0, 2pi)
+        key_phi = torch.where(enc_ap > 0, key_phi, torch.full_like(key_phi, float('nan'))).cpu().numpy()
+        enc_open = (enc_ap > 0).cpu().numpy()
         phases = torch.remainder(model.key_phases(), 2 * np.pi).cpu().numpy()[:, 0]   # wrapped to [0, 2pi)
 
     rmse_cum = [FunctionApproxLoss.per_function_rmse(f, target) for f in f_cum]
@@ -384,9 +516,11 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
 
     N = model.N_sim
     L = model.layer_size_sim
-    E = model.encoding_x_num_sim
     ly0 = (N - L) // 2
-    ey0 = (N - E) // 2
+    # mask of every encoding patch copy (mean intensity is taken over its open pixels)
+    in_patch = np.zeros((N, N), dtype=bool)
+    for r0, q0, h, w in _encoding_boxes(model):
+        in_patch[r0:r0 + h, q0:q0 + w] = True
 
     fig, axes = plt.subplots(M, 4, figsize=(19, 3.4 * M), dpi=dpi, squeeze=False)
     tgt = target[:, k].numpy(); a_np = a_all.numpy()
@@ -405,24 +539,30 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
 
         ax = axes[m, 1]
         I = key_I[m]
-        enh = I[ey0:ey0 + E, ey0:ey0 + E].mean()   # incident (unit-amplitude) intensity == 1
+        # mean over the OPEN pixels of the encoding patch (all of it when transparent);
+        # incident (unit-amplitude) intensity == 1
+        enh = I[in_patch & enc_open].mean()
         crop = I[ly0:ly0 + L, ly0:ly0 + L]
         # vmin=0: otherwise a uniform field (z=0: |exp(j*phi)|^2 == 1 everywhere) gets its
         # ~1e-7 float rounding stretched over the whole colormap and looks like speckle
         im = ax.imshow(crop, cmap='inferno', vmin=0, vmax=max(crop.max(), 1.0))
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03).set_label('× incident', fontsize=8)
-        ax.add_patch(Rectangle((ey0 - ly0 - 0.5, ey0 - ly0 - 0.5), E, E,
-                                fill=False, edgecolor='cyan', linewidth=1.2))
+        for r0, q0, h, w in _encoding_boxes(model):
+            ax.add_patch(Rectangle((q0 - ly0 - 0.5, r0 - ly0 - 0.5), w, h,
+                                   fill=False, edgecolor='cyan', linewidth=1.2))
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_xlabel(f'mean intensity in footprint = {enh:.1f}x incident', fontsize=9)
         if m == 0:
             ax.set_title('Intensity at encoding plane', fontsize=11, fontweight='bold')
 
         ax = axes[m, 2]
-        im = ax.imshow(key_phi[m][ly0:ly0 + L, ly0:ly0 + L], cmap='twilight', vmin=0, vmax=2 * np.pi)
+        phi_cmap = plt.get_cmap('twilight').copy()
+        phi_cmap.set_bad('black')                    # blocked by an opaque background: no phase
+        im = ax.imshow(key_phi[m][ly0:ly0 + L, ly0:ly0 + L], cmap=phi_cmap, vmin=0, vmax=2 * np.pi)
         phase_cbar(im, ax)
-        ax.add_patch(Rectangle((ey0 - ly0 - 0.5, ey0 - ly0 - 0.5), E, E,
-                                fill=False, edgecolor='cyan', linewidth=1.2))
+        for r0, q0, h, w in _encoding_boxes(model):
+            ax.add_patch(Rectangle((q0 - ly0 - 0.5, r0 - ly0 - 0.5), w, h,
+                                   fill=False, edgecolor='cyan', linewidth=1.2))
         ax.set_xticks([]); ax.set_yticks([])
         if m == 0:
             ax.set_title('Phase at encoding plane', fontsize=11, fontweight='bold')
@@ -444,7 +584,7 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
     fig.suptitle(
         'Phase-key evolution  (function shown: median-error f_%d of the full model; cyan box = encoding footprint)\n' % k +
         r'($N = r \cdot 2 N_p N_f$,  ' +
-        f'r={config.r}  Np={config.Np}  Nf={config.Nf}  M={config.M}  K={config.num_layers})',
+        f'r={config.r}  {_enc_tag(config)}  Nf={config.Nf}  M={config.M}  K={config.num_layers})',
         fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.97], w_pad=2.5, h_pad=2.0)
     path = os.path.join(out_dir, 'key_evolution.png')
@@ -550,7 +690,13 @@ def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_l
     if csv_path is not None:
         _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse)
 
-    _save_test_summary(agg, rmse, config, os.path.join(out_dir, 'test_summary.png'))
+    # Per-function RMSE [Nf], index k = detector (row*pd_num_cols + col).
+    # Saved so per-detector maps / asymmetry stats can be redone without re-testing.
+    np.save(os.path.join(out_dir, 'per_function_rmse.npy'), rmse.cpu().numpy())
+
+    _save_test_summary(agg, rmse, config, model, os.path.join(out_dir, 'test_summary.png'))
+    _save_plane_layout(model, config, out_dir)
+    _save_encoding_frames(model, config, out_dir)
 
     # ── Phase keys / layers / key similarity ───────────────────────────────
     _save_phase_keys(model, out_dir)
