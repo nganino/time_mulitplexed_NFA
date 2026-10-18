@@ -129,8 +129,7 @@ def _print_summary(agg, tag='Test'):
 def _enc_tag(config):
     '''Np / N_alpha / mode text for figure titles.'''
     if getattr(config, 'encoding_mode', 'constant') == 'split':
-        return (f'Np={config.Np}/frame  N_alpha={config.N_alpha} (split, '
-                f'{getattr(config, "split_patch", "frame")})')
+        return f'Np={config.Np}/frame  N_alpha={config.N_alpha} (split)'
     return f'Np={config.Np}'
 
 
@@ -200,13 +199,13 @@ def _save_test_summary(agg, rmse, config, model, save_path, n_show=4, dpi=200, e
 
     # ---- top-middle: input encoding plane (phase), zoomed on the patch -------
     # Same view as the logs/sanity_checks encoding figures: crop = patch + a small
-    # margin, green grid = sim pixels, cyan box = encoding patch. Opaque (blocked)
-    # pixels are drawn black.
+    # margin (4 SLM px), cyan box = encoding patch.
     ax_enc = fig.add_subplot(gs[0, hist_w:hist_w + cx_w])
     with torch.no_grad():
-        a_show = torch.tensor([enc_a], device=model.encoding_aperture.device)
-        U = model.encoding_aperture * torch.exp(1j * model._encode_input(a_show))
-    N, margin = config.N_sim, 4
+        a_show = torch.tensor([enc_a], device=model.slm_aperture.device)
+        U = torch.exp(1j * model._input_plane_phase(a_show))
+    step = model.phase_key_bin                                 # sim px per SLM pixel
+    N, margin = config.N_sim, 4 * step
     Ph, Pw = model.encoding_y_num_sim, model.encoding_x_num_sim  # one patch copy, sim px
     X = model.encoding_extent_sim                              # all patch copies
     W = X + 2 * margin
@@ -216,9 +215,7 @@ def _save_test_summary(agg, rmse, config, model, save_path, n_show=4, dpi=200, e
     cmap = plt.get_cmap('twilight').copy(); cmap.set_bad('black')
     im_enc = ax_enc.imshow(np.ma.masked_where(amp == 0, phase), cmap=cmap, vmin=0,
                            vmax=2 * np.pi, interpolation='nearest')
-    ax_enc.set_xticks(np.arange(-0.5, W, 1), minor=True); ax_enc.set_yticks(np.arange(-0.5, W, 1), minor=True)
-    ax_enc.grid(which='minor', color='lime', linewidth=0.3, alpha=0.7)
-    ax_enc.tick_params(which='both', length=0); ax_enc.set_xticks([]); ax_enc.set_yticks([])
+    ax_enc.set_xticks([]); ax_enc.set_yticks([])
     for r0, q0, h, w in _encoding_boxes(model):               # cyan box per patch copy
         ax_enc.add_patch(Rectangle((q0 - c0 - 0.5, r0 - c0 - 0.5), w, h, fill=False,
                                    edgecolor='cyan', linewidth=1.2))
@@ -266,7 +263,7 @@ def _save_test_summary(agg, rmse, config, model, save_path, n_show=4, dpi=200, e
         if i == 0:
             ax.legend(fontsize=7)
 
-    fig.suptitle(f'Test summary   mean RMSE={rmse.mean():.2e}   max RMSE={rmse.max():.2e}\nr={config.r}  {_enc_tag(config)}  Nf={config.Nf}  M={config.M}  K={config.num_layers}\ninput plane opaque background = {config.encoding_opaque_background} key_to_input_dist = {config.key_to_enc_spacing} key_size = {config.phase_key_size}', fontsize=10)
+    fig.suptitle(f'Test summary   mean RMSE={rmse.mean():.2e}   max RMSE={rmse.max():.2e}\nr={config.r}  {_enc_tag(config)}  Nf={config.Nf}  M={config.M}  K={config.num_layers}\nkey_to_input_dist = {config.key_to_enc_spacing} key_size = {config.phase_key_size}', fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(save_path, bbox_inches='tight')
     plt.close(fig)
@@ -320,9 +317,9 @@ def _save_encoding_frames(model, config, out_dir, dpi=200, enc_a=0.3):
     if model.encoding_mode != 'split':
         return
     with torch.no_grad():
-        a_show = torch.tensor([enc_a], device=model.encoding_aperture.device)
-        U = model.encoding_aperture * torch.exp(1j * model._encode_input(a_show))   # [1, M, N, N]
-    N, X, margin = config.N_sim, model.encoding_extent_sim, 4
+        a_show = torch.tensor([enc_a], device=model.slm_aperture.device)
+        U = torch.exp(1j * model._input_plane_phase(a_show))   # [1, M, N, N]
+    N, X, margin = config.N_sim, model.encoding_extent_sim, 4 * model.phase_key_bin
     W = X + 2 * margin
     c0 = (N - X) // 2 - margin
     cmap = plt.get_cmap('twilight').copy(); cmap.set_bad('black')
@@ -364,23 +361,29 @@ def _save_plane_layout(model, config, out_dir, dpi=200, enc_a=0.3):
         dev = model.slm_aperture.device
         key = torch.remainder(model._get_slm_field()[0, 0], 2 * np.pi)
         key = np.ma.masked_where((model.slm_aperture[0, 0] == 0).cpu().numpy(), key.cpu().numpy())
-        U = model.encoding_aperture * torch.exp(1j * model._encode_input(torch.tensor([enc_a], device=dev)))
+        U = torch.exp(1j * model._input_plane_phase(torch.tensor([enc_a], device=dev)))
         enc = np.ma.masked_where((U.abs()[0, 0] == 0).cpu().numpy(),
                                  torch.remainder(torch.angle(U)[0, 0], 2 * np.pi).cpu().numpy())
-        lay = (torch.remainder(model._get_layer_phase(0)[0, 0], 2 * np.pi)).cpu().numpy()
-        lay = np.ma.masked_where((model.layer_aperture[0, 0] == 0).cpu().numpy(), lay)
+        lay = None                                             # K = 0: no layer, panel left blank
+        if model.num_layers > 0:
+            lay = (torch.remainder(model._get_layer_phase(0)[0, 0], 2 * np.pi)).cpu().numpy()
+            lay = np.ma.masked_where((model.layer_aperture[0, 0] == 0).cpu().numpy(), lay)
 
     fig, axes = plt.subplots(1, 4, figsize=(17, 4.6), dpi=dpi)
     Ph, Pw = config.encoding_y_num_sim, config.encoding_x_num_sim
     L, Kk = config.layer_size_sim, config.phase_key_size_sim
-    panels = [(key, f'Phase key 0  ({Kk} px = {Kk * dx_um:.1f} µm)'),
-              (enc, f'Encoding plane, a = {enc_a}  (patch {Ph}x{Pw} px = {Ph * dx_um:.1f}x{Pw * dx_um:.1f} µm,\n'
+    panels = [(key, f'Phase key 0  ({Kk / config.sim_per_slm} slm px = {Kk * dx_um:.1f} µm)'),
+              (enc, f'Encoding plane, a = {enc_a}  (patch {Ph / config.sim_per_slm}x{Pw / config.sim_per_slm} slm px = {Ph * dx_um:.1f}x{Pw * dx_um:.1f} µm,\n'
                     f'bin {config.encoding_patch_scale}, gap {config.encoding_gap_blocks}, '
-                    f'tiles {model.encoding_tile_pattern}, background {"opaque" if config.encoding_opaque_background else "transparent"})'),
-              (lay, f'Diffractive layer 1  ({L} px = {L * dx_um:.1f} µm)')]
+                    f'tiles {model.encoding_tile_pattern})'),
+              (lay, f'Diffractive layer 1  ({L / config.sim_per_slm} slm px = {L * dx_um:.1f} µm)' if lay is not None
+                    else 'No diffractive layers (K = 0)')]
     im = None
     for ax, (img, title) in zip(axes[:3], panels):
-        im = ax.imshow(img, cmap=cmap, vmin=0, vmax=2 * np.pi, interpolation='nearest')
+        if img is None:                                        # K = 0 layer panel
+            ax.imshow(np.zeros((N, N)), cmap='gray', vmin=0, vmax=1, interpolation='nearest')
+        else:
+            im = ax.imshow(img, cmap=cmap, vmin=0, vmax=2 * np.pi, interpolation='nearest')
         ax.set_title(title, fontsize=9)
     for r0, q0, h, w in _encoding_boxes(model):               # cyan box per patch copy
         axes[1].add_patch(Rectangle((q0 - 0.5, r0 - 0.5), w, h, fill=False, edgecolor='cyan', linewidth=1.2))
@@ -399,7 +402,8 @@ def _save_plane_layout(model, config, out_dir, dpi=200, enc_a=0.3):
         ax.set_xticks([0, N // 2, N - 1]); ax.set_yticks([0, N // 2, N - 1]); ax.tick_params(labelsize=7)
     cbar = fig.colorbar(im, ax=axes[:3], fraction=0.015, pad=0.01)
     cbar.set_ticks([0, np.pi, 2 * np.pi]); cbar.set_ticklabels(['0', 'π', '2π'])
-    fig.suptitle(f'Plane layout on the {N} x {N} sim grid ({N * dx_um:.1f} µm; 1 px = {dx_um * 1e3:.0f} nm)   '
+    fig.suptitle(f'Plane layout on the {N} x {N} sim grid ({N * dx_um:.1f} µm; 1 px = {dx_um * 1e3:.0f} nm; '
+                 f'SLM px {config.slm_dx * 1e6:.3g} µm, camera px {config.camera_dx * 1e6:.3g} µm)\n'
                  f'{_enc_tag(config)}  Nf={config.Nf}  K={config.num_layers}  M={config.M}'
                  f'{"  (encoding plane: frame 0)" if model.encoding_mode == "split" else ""}', fontsize=10)
     path = os.path.join(out_dir, 'plane_layout.png')
@@ -434,6 +438,9 @@ def _save_phase_keys(model, out_dir, dpi=200):
 def _save_layer_masks(model, out_dir, dpi=200):
     '''Grid of the learned diffractive-layer phase masks (one per layer,
     shared across all M phase keys).'''
+    if model.num_layers == 0:                                  # K = 0: nothing to draw
+        print('No diffractive layers (K = 0): layer_masks_final.png skipped')
+        return
     with torch.no_grad():
         masks = (torch.sigmoid(model.layer_phases) * 2 * np.pi).cpu()
     K = masks.shape[0]
@@ -455,19 +462,50 @@ def _save_layer_masks(model, out_dir, dpi=200):
     print(f'Layer masks saved → {path}')
 
 
+def _save_decoder_mask(model, config, out_dir, dpi=200):
+    '''E+D architecture: the learned decoder phase on the encoding plane, one value per SLM pixel, wrapped to
+    [0, 2pi); encoding pixels (not part of the decoder; decoder adds exactly 0 there) in lime, a colour outside the twilight map
+    (black would read as pi on it). Left: the whole decoder square; right: zoom on
+    the centre patch copy. Saved as decoder_mask.png; skipped when there is no decoder.'''
+    if not getattr(model, 'decoder', False):
+        return
+    s, y0, x0, D = model.phase_key_bin, model.decoder_y0, model.decoder_x0, model.decoder_size_sim
+    with torch.no_grad():
+        phi = model._decoder_phase_sim()[0, 0, y0:y0 + D:s, x0:x0 + D:s].cpu().numpy()     # SLM px grid
+        on = model.decoder_mask[0, 0, y0:y0 + D:s, x0:x0 + D:s].cpu().numpy() > 0.5
+    img = np.ma.masked_where(~on, np.mod(phi, 2 * np.pi))
+    cmap = plt.get_cmap('twilight').copy(); cmap.set_bad('lime')
+    n = model.decoder_size
+    ph, pw = model.encoding_y_num_sim // s, model.encoding_x_num_sim // s              # one patch, SLM px
+    cy, cx = (model.N_sim // 2 - y0) // s, (model.N_sim // 2 - x0) // s                 # grid centre, SLM px
+    hz = max(ph, pw) // 2 + 6
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.4), dpi=dpi)
+    for ax, (r0, r1, c0, c1), title in [
+            (axes[0], (0, n, 0, n), f'decoder, {n} x {n} SLM px ({n * config.slm_dx * 1e3:.2f} mm)'),
+            (axes[1], (cy - hz, cy + hz, cx - hz, cx + hz), 'zoom: centre patch copy')]:
+        im = ax.imshow(img[r0:r1, c0:c1], cmap=cmap, vmin=0, vmax=2 * np.pi, interpolation='nearest',
+                       extent=[c0, c1, r1, r0])
+        ax.set_title(title, fontsize=10); ax.set_xlabel('SLM px')
+    cb = fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02); cb.set_ticks([0, np.pi, 2 * np.pi]); cb.set_ticklabels(['0', 'π', '2π'])
+    fig.suptitle(f'Encoding-plane decoder phase (lime = encoding pixels: decoder adds 0, they carry only the encoding phase)   {_enc_tag(config)}  Nf={config.Nf}  '
+                 f'M={config.M}  K={config.num_layers}', fontsize=10)
+    path = os.path.join(out_dir, 'decoder_mask.png')
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Decoder mask saved → {path}')
+
+
 def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
     '''
     M rows x 4 columns, one row per phase key m:
       col 1: learned phase key m
-      col 2: intensity key m deposits on the encoding plane, times the encoding
-             aperture (an opaque background is shown dark), cropped to the
+      col 2: intensity key m deposits on the encoding plane, cropped to the
              layer aperture, footprint of the encoding region outlined, mean
-             intensity over the footprint's OPEN pixels vs. the unit
+             intensity over the footprint vs. the unit
              incident intensity -- NOT a power fraction, since the key aperture
              fills the whole grid and most power is unmodulated background)
       col 3: phase of key m's field at the encoding plane (same crop/outline,
-             wrapped to [0, 2pi), black where the aperture blocks the light;
-             the key's field only, before the a-dependent encoding phase is added)
+             wrapped to [0, 2pi); the key's field only, before the a-dependent encoding phase is added)
       col 4: target vs. approximation using keys 0..m only (mean of the first
              m+1 per-key detector readouts through the trained affine readout),
              for the median-error function of the FULL model, held fixed across
@@ -502,22 +540,17 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
     with torch.no_grad():
         f_cum = [criterion.normalize(I_all[:, :m + 1].mean(1).to(device)).cpu() for m in range(M)]
         key_I, key_phi = model.key_intensity_at_encoding()       # [M, N_sim, N_sim] each
-        # what actually leaves the encoding plane: an opaque background blocks everything
-        # outside the encoding pixels (transparent: aperture is all ones, no change)
-        enc_ap = model.encoding_aperture[0, 0]                   # [N_sim, N_sim], 0/1
-        key_I = (key_I * enc_ap).cpu().numpy()
-        key_phi = torch.remainder(key_phi, 2 * np.pi)   # angle() is (-pi, pi]; wrap to [0, 2pi)
-        key_phi = torch.where(enc_ap > 0, key_phi, torch.full_like(key_phi, float('nan'))).cpu().numpy()
-        enc_open = (enc_ap > 0).cpu().numpy()
+        key_I = key_I.cpu().numpy()
+        key_phi = torch.remainder(key_phi, 2 * np.pi).cpu().numpy()   # angle() is (-pi, pi]; wrap to [0, 2pi)
         phases = torch.remainder(model.key_phases(), 2 * np.pi).cpu().numpy()[:, 0]   # wrapped to [0, 2pi)
 
     rmse_cum = [FunctionApproxLoss.per_function_rmse(f, target) for f in f_cum]
     k = int(torch.argsort(rmse_cum[-1])[len(rmse_cum[-1]) // 2])
 
     N = model.N_sim
-    L = model.layer_size_sim
+    L = model.layer_size_sim if model.num_layers > 0 else model.phase_key_size_sim   # K = 0: crop to the key
     ly0 = (N - L) // 2
-    # mask of every encoding patch copy (mean intensity is taken over its open pixels)
+    # mask of every encoding patch copy (mean intensity is taken over it)
     in_patch = np.zeros((N, N), dtype=bool)
     for r0, q0, h, w in _encoding_boxes(model):
         in_patch[r0:r0 + h, q0:q0 + w] = True
@@ -539,9 +572,8 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
 
         ax = axes[m, 1]
         I = key_I[m]
-        # mean over the OPEN pixels of the encoding patch (all of it when transparent);
-        # incident (unit-amplitude) intensity == 1
-        enh = I[in_patch & enc_open].mean()
+        # mean over the encoding patch copies; incident (unit-amplitude) intensity == 1
+        enh = I[in_patch].mean()
         crop = I[ly0:ly0 + L, ly0:ly0 + L]
         # vmin=0: otherwise a uniform field (z=0: |exp(j*phi)|^2 == 1 everywhere) gets its
         # ~1e-7 float rounding stretched over the whole colormap and looks like speckle
@@ -556,9 +588,7 @@ def _save_key_evolution(model, config, ckpt_path, device, out_dir, dpi=200):
             ax.set_title('Intensity at encoding plane', fontsize=11, fontweight='bold')
 
         ax = axes[m, 2]
-        phi_cmap = plt.get_cmap('twilight').copy()
-        phi_cmap.set_bad('black')                    # blocked by an opaque background: no phase
-        im = ax.imshow(key_phi[m][ly0:ly0 + L, ly0:ly0 + L], cmap=phi_cmap, vmin=0, vmax=2 * np.pi)
+        im = ax.imshow(key_phi[m][ly0:ly0 + L, ly0:ly0 + L], cmap='twilight', vmin=0, vmax=2 * np.pi)
         phase_cbar(im, ax)
         for r0, q0, h, w in _encoding_boxes(model):
             ax.add_patch(Rectangle((q0 - ly0 - 0.5, r0 - ly0 - 0.5), w, h,
@@ -627,24 +657,17 @@ def _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse):
 
 def _load_and_evaluate(ckpt_path):
     '''
-    Load a checkpoint (config + model + criterion) and run one eval pass over
-    its own dense test grid. Returns (agg, config, model, device) -- the raw
-    building block shared by evaluate() and cross-run comparison scripts
-    (e.g. plot_sweep_grid.py). Callers get rmse (and a printed summary) via
-    _print_summary(agg).
+    Load a checkpoint (config + model + criterion) and run one eval pass over its own dense test grid. 
     '''
     config = init_params()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Preserve local paths -- machine-specific, must not be overwritten by
-    # whatever was saved inside the checkpoint.
+    # Preserve local paths -- machine-specific, must not be overwritten by whatever was saved inside the checkpoint.
     _path_keys = ('log_dir', 'image_dir', 'model_dir', 'tfboard_dir')
     saved_paths = {k: getattr(config, k, None) for k in _path_keys}
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if 'config' in ckpt:
-        # every saved key is marked explicit, so recompute_derived() rebuilds
-        # exactly what was trained (never re-derives e.g. layer_size)
         apply_saved_config(config, ckpt['config'])
         for k, v in saved_paths.items():
             if v is not None:
@@ -701,6 +724,7 @@ def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_l
     # ── Phase keys / layers / key similarity ───────────────────────────────
     _save_phase_keys(model, out_dir)
     _save_layer_masks(model, out_dir)
+    _save_decoder_mask(model, config, out_dir)
     _save_mask_similarity(model, out_dir)
     if ckpt_path is not None:
         _save_key_evolution(model, config, ckpt_path, device, out_dir)

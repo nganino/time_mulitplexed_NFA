@@ -114,22 +114,25 @@ Current defaults (paper-scale regime, adopted 2026-09-17):
 | category | key params | default | source |
 |---|---|---|---|
 | optics | `wavelength` | 550 nm | PAPER Sec. 2.2 |
-| optics | `pixel_pitch` | `0.55 * wavelength` ~= 302.5 nm | PAPER Sec. 2.2 (shared pitch for input px, output px, AND diffractive feature width) |
-| sim grid | `sim_dx` | `= pixel_pitch` (bin factor 1 everywhere) | derived |
-| sim grid | `N_sim` | 256 | our choice: ~7.5x guard band around the largest single-plane aperture (~34px), FFT-friendly power of 2 |
+| optics | `device_profile` | `'sim'` | `'sim'` or `'lab'`, see "Device profiles" below; fills the pitch, distance, detector and `N_sim` defaults (2026-10-13, replaced `pixel_pitch`) |
+| optics | `slm_dx` | 300 nm (`sim`) / 8 um (`lab`) | pitch of the phase keys AND the diffractive layers (one pitch since 2026-10-13; `layer_dx` is just a copy) |
+| sim grid | `sim_per_slm` | 1 (`sim`) / 8 (`lab`) | sim px per SLM px; `sim_dx = slm_dx / sim_per_slm`, so every bin is an exact integer. `--set sim_dx=...` instead fixes `sim_per_slm` (must divide exactly) |
+| sim grid | `N_sim` | 256 (`sim`) / `'auto'` (`lab`) | `'auto'`: largest plane (key, layer, encoding extent, detector array) + 2 x light spread over the longest gap, rounded up to 64. Spread angle = min(grid limit, `guard_orders` (2) diffraction orders of one SLM pixel). A WARNING flags gaps beyond the ASM aliasing limit `N_sim * asm_pad_factor * sim_dx^2 / wavelength` |
 | targets | `Np` | 9 (3x3 patch) | PAPER Sec. 2.2, fixed across all their Nf sweeps |
 | targets | `Nf` | 100 | PAPER Fig. 2's smallest tested value (they go up to 1e6) |
 | targets | `a_min`, `a_max` | -0.5, 0.5 | PAPER |
 | targets | `func_seed` | 0 | our reproducibility knob (paper only specifies the sampling distributions, Eq. 10) |
 | phase key | `M` | 1 | our addition, not paper-derived; **the whole point of this project is to sweep this** |
-| encoding | `encoding_tile_pattern` | `'single'` | identical copies of the encoding patch on a 3x3 grid (2026-10-09): `'single'` (centre only), `'x'` (centre + diagonals), `'plus'` (centre + edges), or a 9-char row-major `0`/`1` string. Copies sit one patch + one gap apart (touching at gap 0); the startup design printout gives the extent and warns when it exceeds the key/layer. (Partial-key training, `key_train_region` / `key_mask_encoder_footprint`, was removed the same day.) |
-| encoding | `encoding_mode` | `'constant'` | how the harmonics are spread over the M keys (2026-10-09). `'constant'`: every frame shows all Np harmonics, N_alpha = Np (paper). `'split'`: frame m shows only harmonics m*Np .. (m+1)*Np-1, so N_alpha = Np*M and N = r*2*N_alpha*Nf grows with M; pixels not shown are phase 0 (cross-block terms can only form by interference with unmodulated light, so keep the background transparent). Needs C = 1. |
-| encoding | `split_patch` | `'frame'` | split mode only: `'frame'` = one Np-pixel patch rewritten every frame; `'full'` = an N_alpha-pixel patch where only frame m's block is active, the rest phase 0. Since 2026-10-10 any pixel count works: the patch is rows x cols, the closest-to-square factorization (6 -> 2x3, 18 -> 3x6, a prime p -> 1xp), placed row-major (raster); the 'reversed'/'spiral' layouts were removed. test.py saves `encoding_frames.png` (input plane per key) in split mode. |
+| encoding | `encoding_tile_pattern` | `'single'` | identical copies of the encoding patch on a 3x3 grid (2026-10-09): `'single'` (centre only), `'x'` (centre + diagonals), `'plus'` (centre + edges), `'full'` (all 9), or a 9-char row-major `0`/`1` string. Since 2026-10-15 also 5x5: `'full5'` (all 25) or a 25-char string. Copies sit one patch + one gap apart (touching at gap 0); the startup design printout gives the extent and warns when it exceeds the key/layer. (Partial-key training, `key_train_region` / `key_mask_encoder_footprint`, was removed the same day.) |
+| encoding | `encoding_mode` | `'constant'` | how the harmonics are spread over the M keys (2026-10-09). `'constant'`: every frame shows all Np harmonics, N_alpha = Np (paper). `'split'`: frame m shows only harmonics m*Np .. (m+1)*Np-1, so N_alpha = Np*M and N = r*2*N_alpha*Nf grows with M; each frame rewrites the same Np-pixel patch with its own block (cross-block terms can only form by interference with unmodulated light, so keep the background transparent). Patch = rows x cols, the closest-to-square factorization (6 -> 2x3, a prime p -> 1xp), row-major. test.py saves `encoding_frames.png` (input plane per key) in split mode. |
+| encoding | `decoder`, `decoder_size`, `lr_decoder` | `False`, `None` (= key size), 1e-2 | E+D architecture (2026-10-15): a learnable phase mask on every encoding-plane SLM pixel that is NOT an encoding pixel (gaps inside each patch, gaps between tile copies, surroundings), `decoder_size` SLM px per side, shared by all M frames. Input-plane phase = encoding phase + decoder phase x mask. Phase stored directly (no sigmoid), initialised to 0, so a freshly added decoder leaves the model unchanged (warm start from a no-decoder checkpoint with `ckpt_to_load=... load_weights_only=true`). Decoder grid is shifted < 1 SLM px so its pixel edges line up with the encoding pixels (one shared SLM grid). Own Adam + cosine schedule (`lr_decoder`); test.py saves `decoder_mask.png`. Off -> bit-identical to before |
 | layers | `num_layers` (K) | 2 | PAPER's default/main design (K=4 is their deeper alt.) |
 | layers | `layer_size` | `ceil(sqrt(N/K))`, `N = N_trainable_features = ceil(r*2*N_alpha*Nf)` (N_alpha = Np, or Np*M in split mode) (34 at Np=9, Nf=100, K=2) | PAPER's guideline `N ~= 1.25*2*Np*Nf` total features. **DERIVED** in `recompute_derived()` from the current Np/Nf/K/M/r unless you `--set layer_size=X` (then X sticks) -- see "How `--set` works" below. `scale_layer_with_M=true` multiplies N by M (constant mode only) |
-| phase key | `phase_key_size` (was `slm_x_num` before 2026-09-28; also `slm_bin`->`phase_key_bin`, `slm_x_num_sim`->`phase_key_size_sim`; old names still accepted via `config.LEGACY_ALIASES`) | `= layer_size_sim / phase_key_bin` (one layer wide); or `phase_key_patch_multiple x encoding_x_num_sim / phase_key_bin` if `phase_key_patch_multiple` is set (default `None`) | own choice (2026-09-18): each key matches ONE diffractive layer. Briefly (2026-10-06 only) the default was 2x the encoding patch, from the Nf=100 key-size sweeps (SWEEP_HANDOVER 4y/4z), where layer and 2x patch were nearly the same size; reverted 2026-10-07 because at Nf=1024 (layers 150-290 px) the layer-size key was far better (4aa/4bb). `--set phase_key_patch_multiple=2` restores the 2x-patch rule. **DERIVED** unless set explicitly; checkpoints keep their trained size (saved configs are explicit). The key plane is lit across the whole grid (outside the key the SLM shows phase 0), so the key size sets the TRAINABLE region, not the illuminated one. A train-start WARNING flags when the key or layers plus their lateral light spread exceed N_sim |
-| spacings | `key_to_enc_spacing`, `slm_first_layer_spacing`, `interlayer_spacing`, `last_layer_ccd_spacing` | all 6 um (fixed) | Since 2026-09-24 a FIXED 6 um instead of the paper's `z = W*sqrt((2*pixel_pitch/wavelength)^2 - 1)` (still in config.py, commented out): the diffraction walk-off is then ~46 px regardless of aperture, so N_sim=256 works for any `layer_size <= 164`. Not derived -- `--set` to change. At `key_to_enc_spacing=0` the key->encoding propagator is skipped and the encoding-plane field is exactly `exp(j*(phi_key + phi_enc))` (`key_to_enc_exact_at_zero`, default True since 2026-09-28; checkpoints saved earlier load it as False via `config.LEGACY_DEFAULTS`, i.e. their original propagated behavior) |
-| detector | `pd_num_rows`, `pd_num_cols` | `sqrt(Nf)` each (10 x 10 at Nf=100) | **DERIVED** unless set; product must equal Nf (asserted). For a non-square Nf, `--set` one side and the other becomes Nf / that side |
+| phase key | `phase_key_size` | `= layer_size_sim / phase_key_bin` (one layer wide); or `phase_key_patch_multiple x encoding_x_num_sim / phase_key_bin` if `phase_key_patch_multiple` is set (default `None`) | own choice (2026-09-18): each key matches ONE diffractive layer. Briefly (2026-10-06 only) the default was 2x the encoding patch, from the Nf=100 key-size sweeps (SWEEP_HANDOVER 4y/4z), where layer and 2x patch were nearly the same size; reverted 2026-10-07 because at Nf=1024 (layers 150-290 px) the layer-size key was far better (4aa/4bb). `--set phase_key_patch_multiple=2` restores the 2x-patch rule. **DERIVED** unless set explicitly; checkpoints keep their trained size (saved configs are explicit). The key plane is lit across the whole grid (outside the key the SLM shows phase 0), so the key size sets the TRAINABLE region, not the illuminated one. A train-start WARNING flags when the key or layers plus their lateral light spread exceed N_sim |
+| spacings | `key_to_enc_spacing`, `slm_first_layer_spacing`, `interlayer_spacing`, `last_layer_ccd_spacing` | all 6 um (`sim`) / 2 mm (`lab`) | From the device profile; `--set` any of them to change. In `sim`, since 2026-09-24 a FIXED 6 um instead of the paper's `z = W*sqrt((2*pixel_pitch/wavelength)^2 - 1)` (still in config.py, commented out): the diffraction walk-off is then ~46 px regardless of aperture, so N_sim=256 works for any `layer_size <= 164`. Not derived -- `--set` to change. At `key_to_enc_spacing=0` the key->encoding propagator is skipped and the encoding-plane field is exactly `exp(j*(phi_key + phi_enc))` (`key_to_enc_exact_at_zero`, default True) |
+| detector | `pd_num_rows`, `pd_num_cols` | `sqrt(Nf)` each (10 x 10 at Nf=100) | always `sqrt(Nf)` (not settable since 2026-10-13); Nf must be a perfect square |
+| detector | `camera_dx` | = `sim_dx` (`sim`) / 6 um (`lab`, the Basler's 5.86 um snapped so a camera px is a whole number of sim px) | camera pixel pitch; `camera_dx / sim_dx` must be an integer (`cam_bin`) |
+| detector | `pd_size_cam`, `pd_pitch_cam` | 3, 3 (`sim`) / 4, 4 (`lab`, 24 um touching detectors) | detector width and centre-to-centre pitch in WHOLE camera pixels (2026-10-13). `photodiode_size` / `pd_row/col_spacing` below are now derived from them in metres; `--set`-ting the metre values (as old configs/checkpoints do) overrides them and is rounded to sim px as before |
 | detector | `photodiode_size` | `3 * pixel_pitch` (3 sim px, since 2026-09-28; was 1 px) | detector width; its reading is the MEAN intensity over its `photodiode_pixels x photodiode_pixels` window. 2-3 px detectors largely removed the need for many phase keys at M=1 (SWEEP_HANDOVER 4o/4p) |
 | detector | `pd_row/col_spacing` | `3 * pixel_pitch` (fixed 3 px pitch) | center-to-center pitch, NOT tied to `photodiode_size` (since 2026-09-28): with the 3 px default detectors they touch (fill fraction 1). Always a whole number of sim pixels -- the old `photodiode_size + 0.5*wavelength` (paper) spacing got truncated to 1 px by `int()`, see "Known open items" |
 | sampling | `train_a_samples` | 10000 | fixed pool, resampled/reshuffled each epoch (NOT regenerated -- drawn once, seeded by `config.seed`) |
@@ -138,13 +141,45 @@ Current defaults (paper-scale regime, adopted 2026-09-17):
 | loss | `norm_momentum` | 0.1 | **OBSOLETE** -- was the EMA rate for the old running Pmin/Pmax buffers; `loss.py` now uses a learned scale/bias instead (see "Known open items") |
 | training | `batch_size`, `max_epoch`, `lr_slm`, `lr_layer` | 64, 150, 1e-2, 1e-2 | `lr_slm` applies to the phase-key plane (name kept from the old SLM-mask era); also reused as the LR for `loss.py`'s learned scale/bias (`opt_readout` in `train.py`) |
 
+### Device profiles (2026-10-13)
+
+`device_profile` switches between the original sub-wavelength simulation and the real
+devices. Every profile value is applied with the "derive unless you set it" rule, so any
+single value can still be `--set`, and a loaded checkpoint keeps exactly what it trained with.
+
+| | `sim` (default) | `lab` |
+|---|---|---|
+| `slm_dx` (keys + layers) | 300 nm | 8 um |
+| `sim_per_slm` -> `sim_dx` | 1 -> 300 nm | 8 -> 1 um |
+| `camera_dx` | = `sim_dx` | 6 um (Basler 5.86 um, snapped) |
+| `pd_size_cam`, `pd_pitch_cam` | 3, 3 | 4, 4 (24 um, touching) |
+| four spacings | 6 um | 2 mm |
+| `N_sim` | 256 | `'auto'` |
+
+`encoding_patch_scale` is the number of SLM pixels per encoding pixel in both profiles (bin 3
+-> 24 um in `lab`). `sim` reproduces every earlier run and checkpoint bit-for-bit.
+
+```
+python train.py --set device_profile=lab Np=36 M=3 encoding_patch_scale=3 encoding_tile_pattern=full
+python train.py --set device_profile=lab sim_per_slm=4            # sim_dx 2 um convergence check
+python train.py --set device_profile=lab last_layer_ccd_spacing=1e-3 N_sim=1536
+```
+
+Lab-profile cost (RTX 4090, one train step, 2026-10-13):
+
+| Config | N_sim | Peak memory | Time per step |
+|---|---|---|---|
+| K2 Np36 M3 B64 | 1152 | 14 GB | 0.30 s |
+| K2 Np64 M3 B32 | 1280 | 9 GB | 0.19 s |
+| K0 Np64 M3 B32 | 2304 | 18 GB | 0.32 s |
+
 ### How `--set` works ("derive unless you set it", since 2026-09-28)
 
 `python train.py --set KEY=VALUE ...` overrides any config.py value (type preserved).
 Then `recompute_derived()` recomputes everything that depends on other values:
 
-- **Design values** -- `N_trainable_features`, `layer_size`, `phase_key_size`,
-  `pd_num_rows`, `pd_num_cols` -- are re-derived from their formulas (table above)
+- **Design values** -- `N_trainable_features`, `layer_size`, `phase_key_size`
+  -- are re-derived from their formulas (table above)
   every time, **unless you `--set` them yourself**, in which case your value sticks.
   So `--set Np=25` alone gives 56 px layers and keys; `--set Nf=1024 num_layers=3`
   gives 88 px layers and a 32 x 32 detector grid; `--set layer_size=60` also moves the
@@ -166,9 +201,11 @@ or default has changed since (verified on old checkpoints, incl. the 125 px
 use `apply_saved_config(cfg, ckpt["config"]); recompute_derived(cfg)`, NOT
 `cfg.__dict__.update(...)`, which would let design values be re-derived.
 
-Old key names (`slm_x_num` etc.) are still accepted in `--set` and in saved configs
-(`config.LEGACY_ALIASES`). Sweep scripts from before 2026-09-28 that pass every
-value explicitly still work unchanged -- they just no longer need to.
+Removed 2026-10-13 (no longer accepted): the pre-2026-09-28 key names (`slm_x_num` etc.,
+`LEGACY_ALIASES`) and `LEGACY_DEFAULTS`, `split_patch` (split mode is always the Np-pixel
+frame patch), `phase_key_bin_scale` (no key binning), setting one detector-grid side
+(`pd_num_rows`/`pd_num_cols`), and the frames-per-key factor `C` (T = M). Checkpoints that
+used any of these can no longer be reproduced exactly.
 
 ## File-by-file reference
 

@@ -13,17 +13,15 @@ import datetime
 
 
 def _build_run_name(tc):
-    # Spacings/pdsize are sub-micron to low-micron at the new paper-scale
-    # regime (was mm/cm for the old benchtop hardware model) -- formatted in
-    # um here so they don't all round to "0mm".
     datetime_str = datetime.datetime.now().strftime('%Y%m%d-%H%M')
     return (f'{datetime_str}'
             f'-Np{tc.Np}{"-split" if getattr(tc, "encoding_mode", "constant") == "split" else ""}'
             f'-Nf{tc.Nf}-M{tc.M}-K{tc.num_layers}'
             f'-Spacings{1e6*tc.key_to_enc_spacing:.2f}um-{1e6*tc.slm_first_layer_spacing:.2f}um-{1e6*tc.interlayer_spacing:.2f}um-{1e6*tc.last_layer_ccd_spacing:.2f}um'
             f'-batchsize{tc.batch_size}-lrkey{tc.lr_slm:.0e}-lrlayer{tc.lr_layer:.0e}-pdsize{1e9*tc.photodiode_size:.0f}nm'
-            f'-trainA{tc.train_a_samples}-{tc.loss_type}')
-
+            f'-trainA{tc.train_a_samples}-{tc.loss_type}'
+            # pitches only when they differ from the original 300 nm simulation, so old names are unchanged
+            f'{"" if abs(tc.slm_dx - 300e-9) < 1e-12 else f"-slm{1e6 * tc.slm_dx:.3g}um-sim{1e6 * tc.sim_dx:.3g}um"}')
 
 def config_to_dict(tc):
     return {k: (v.item() if hasattr(v, 'item') else v)
@@ -31,82 +29,35 @@ def config_to_dict(tc):
             if not k.startswith('_') and (isinstance(v, (int, float, str, bool, type(None)))
                                            or hasattr(v, 'item'))}
 
-
 def _build_log_paths(tc):
-    '''Single source of truth for where a run's output goes, derived from tc.run_name.
-    '''
     tc.log_dir     = os.path.join(_paths.LOG_DIR, tc.run_name)
     tc.image_dir   = os.path.join(tc.log_dir, 'images')
     tc.model_dir   = os.path.join(tc.log_dir, 'model')
     tc.tfboard_dir = os.path.join(tc.log_dir, 'tfboard')
 
 
-# Config keys renamed 2026-09-28 (old name -> new name). Checkpoints saved before
-# the rename store the OLD names in their config dict, and older sweep scripts pass
-# them via --set, so both paths translate through this map (_migrate_legacy_keys
-# below, and train.py's _apply_overrides).
-LEGACY_ALIASES = {
-    'slm_x_num':     'phase_key_size',
-    'slm_bin':       'phase_key_bin',
-    'slm_x_num_sim': 'phase_key_size_sim',
-}
-
-
-def _migrate_legacy_keys(tc):
-    '''Move any pre-rename keys (e.g. from a loaded checkpoint config) onto their
-    new names. The loaded value wins over whatever default init_params() set.'''
-    explicit = _explicit_set(tc)
-    for old, new in LEGACY_ALIASES.items():
-        if old in tc.__dict__:
-            setattr(tc, new, tc.__dict__.pop(old))
-        if old in explicit:
-            explicit.discard(old)
-            explicit.add(new)
-
-
-# --------------------------------------------------------------------------- #
-#  "Derive unless you set it"                                                  #
-#                                                                              #
-#  DESIGN_KEYS are re-derived from their formulas on EVERY recompute_derived() #
-#  call (so `--set Np=25` alone gives the right layer size), UNLESS the key is #
-#  in tc._explicit -- i.e. you passed it via --set (train.py _apply_overrides) #
-#  or it came from a saved checkpoint config (apply_saved_config). Explicit    #
-#  values are never overwritten. tc._explicit starts with a leading '_' so     #
-#  config_to_dict() never writes it to config.json.                            #
-# --------------------------------------------------------------------------- #
-DESIGN_KEYS = ('N_trainable_features', 'layer_size', 'phase_key_size',
-               'pd_num_rows', 'pd_num_cols')
-
+#  DESIGN_KEYS are re-derived from their formulas on EVERY recompute_derived() call                          #
+DESIGN_KEYS = ('N_trainable_features', 'layer_size', 'phase_key_size')
 
 def _explicit_set(tc):
     if not isinstance(getattr(tc, '_explicit', None), set):
         tc._explicit = set()
     return tc._explicit
 
-
 def mark_explicit(tc, keys):
     '''Record keys as user-set, so recompute_derived() never re-derives them.'''
     _explicit_set(tc).update(keys)
 
 
-# Behavior switches added after checkpoints already existed: a saved config that
-# lacks the key was trained with the OLD behavior, so it loads with this value
-# instead of the current default (keeps old checkpoints reproducible).
-LEGACY_DEFAULTS = {
-    'key_to_enc_exact_at_zero': False,   # added 2026-09-28; before, z=0 still ran the propagator
-}
-
-
 def apply_saved_config(tc, saved):
     '''Load a saved config dict (e.g. ckpt['config']) onto tc and mark EVERY
     loaded key explicit, so the rebuilt model is exactly what was trained --
-    even if a formula or default has changed since (LEGACY_DEFAULTS covers
-    switches the saved config predates). Call recompute_derived(tc) afterwards.'''
+    even if a formula or default has changed since. Call recompute_derived(tc) afterwards.'''
     tc.__dict__.update(saved)
-    for key, old_value in LEGACY_DEFAULTS.items():
-        if key not in saved:
-            setattr(tc, key, old_value)
-    mark_explicit(tc, list(saved.keys()) + list(LEGACY_DEFAULTS))
+    mark_explicit(tc, list(saved.keys()))
+    if 'encoding_tile_pattern' not in saved:     # saved before tiles existed (2026-10-09): one patch
+        tc.encoding_tile_pattern = 'single'
+        mark_explicit(tc, ['encoding_tile_pattern'])
 
 
 def _derive(tc, key, value):
@@ -118,164 +69,215 @@ def describe_design(tc):
     '''One line per design value, tagged [set] or [derived] -- printed at train start.'''
     tag = lambda k: 'set' if k in _explicit_set(tc) else 'derived'
     lines = [
+        f'  device profile = {tc.device_profile}: SLM {1e6 * tc.slm_dx:.3g} um, sim {1e6 * tc.sim_dx:.3g} um '
+        f'({tc.sim_per_slm} sim px / SLM px), camera {1e6 * tc.camera_dx:.3g} um ({tc.cam_bin} sim px), '
+        f'N_sim {tc.N_sim} ({1e3 * tc.N_sim * tc.sim_dx:.3g} mm), gaps '
+        f'{", ".join(f"{1e3 * z:.3g}" for z in _plane_gaps(tc))} mm',
         f'  N_trainable_features = {tc.N_trainable_features} [{tag("N_trainable_features")}]'
         f'  (formula: ceil(r*2*N_alpha*Nf{"*M" if tc.scale_layer_with_M and tc.encoding_mode == "constant" else ""}), '
         f'r={tc.r}, N_alpha={tc.N_alpha}, Nf={tc.Nf})',
-        f'  layer_size     = {tc.layer_size} [{tag("layer_size")}]  (formula: ceil(sqrt(N/K)), K={tc.num_layers})',
+        (f'  layer_size     = {tc.layer_size} [{tag("layer_size")}]  (formula: ceil(sqrt(N/K)), K={tc.num_layers})'
+         if tc.num_layers > 0 else '  layer_size     = 0  (K = 0: no diffractive layers, only the phase keys train)'),
         f'  phase_key_size = {tc.phase_key_size} [{tag("phase_key_size")}]  (formula: '
-        f'{"= layer_size" if getattr(tc, "phase_key_patch_multiple", None) is None else str(tc.phase_key_patch_multiple) + " x encoding patch"}'
-        f' / key bin{", grid-aligned to encoding" if getattr(tc, "phase_key_bin_scale", 1) > 1 else ""})'
-        f', bin {tc.phase_key_bin} -> {tc.phase_key_size_sim} sim px',
-        f'  detectors      = {tc.pd_num_rows} x {tc.pd_num_cols} [{tag("pd_num_rows")}/{tag("pd_num_cols")}]'
+        f'{(str(tc.phase_key_patch_multiple) + " x encoding patch") if getattr(tc, "phase_key_patch_multiple", None) is not None else ("fixed by the " + tc.device_profile + " profile") if DEVICE_PROFILES[tc.device_profile].get("phase_key_size") is not None else "= layer_size"}'
+        f' / key bin) -> {tc.phase_key_size_sim} sim px',
+        f'  detectors      = {tc.pd_num_rows} x {tc.pd_num_cols}'
         f'  (formula: sqrt(Nf)); size {tc.photodiode_pixels} px, pitch '
         f'{tc.pd_row_spacing_px} x {tc.pd_col_spacing_px} px',
-        f'  encoding mode  = {tc.encoding_mode}: Np = {tc.Np} px per frame, N_alpha = {tc.N_alpha} harmonics'
-        f'{", patch " + tc.split_patch if tc.encoding_mode == "split" else ""}',
+        f'  encoding mode  = {tc.encoding_mode}: Np = {tc.Np} px per frame, N_alpha = {tc.N_alpha} harmonics',
         f'  encoding       = {tc.encoding_rows} x {tc.encoding_cols} px (rows x cols), bin {tc.encoding_bin}, '
         f'gap {tc.encoding_gap_blocks} -> {tc.encoding_y_num_sim} x {tc.encoding_x_num_sim} sim px',
         f'  encoding tiles = {getattr(tc, "encoding_tile_pattern", "single")} '
         f'-> extent {tc.encoding_extent_sim} sim px',
     ]
+    if getattr(tc, 'decoder', False):
+        lines.append(f'  decoder (E+D)  = {tc.decoder_size_px} x {tc.decoder_size_px} SLM px '
+                     f'({"= key size" if tc.decoder_size is None else "set"}) -> {tc.decoder_size_sim} sim px, shared by '
+                     f'all M frames, trainable on every '
+                     f'{"pixel (incl. encoding pixels)" if getattr(tc, "decoder_over_encoding", False) else "non-encoding pixel"}, phase init 0')
     # Patch copies outside the key are not key-modulated, outside the layer they miss layer 1.
-    if tc.encoding_extent_sim > min(tc.phase_key_size_sim, tc.layer_size_sim):
+    cover = tc.phase_key_size_sim if tc.num_layers == 0 else min(tc.phase_key_size_sim, tc.layer_size_sim)
+    if tc.encoding_extent_sim > cover:
         lines.append(f'  WARNING: encoding extent {tc.encoding_extent_sim} px > key/layer '
-                     f'{min(tc.phase_key_size_sim, tc.layer_size_sim)} px -- outer copies '
+                     f'{cover} px -- outer copies '
                      f'are not covered by the key / first layer')
-    # Guard band: light leaving a plane spreads sideways by up to ~z*tan(theta_max) over a
-    # spacing z (sin(theta_max) = lambda / (2 sim_dx), the steepest angle a 1-px pattern
-    # makes). If aperture + 2*spread exceeds N_sim, the FFT propagator wraps light around the
-    # grid edges -- e.g. Nf=1024/Np=64 layers (203-287 px) need N_sim >= 384.
-    s = min(tc.wavelength / (2 * tc.sim_dx), 0.999)
-    spread = lambda z: int(np.ceil(z * s / np.sqrt(1 - s * s) / tc.sim_dx))
-    checks = [('phase key', tc.phase_key_size_sim, tc.key_to_enc_spacing),
-              ('layer', tc.layer_size_sim, max(tc.slm_first_layer_spacing, tc.interlayer_spacing,
-                                               tc.last_layer_ccd_spacing))]
+    # Guard band: to prevent light from wrapping around the simulation grid due to FFT
+    if tc.num_layers > 0:
+        checks = [('phase key', tc.phase_key_size_sim, tc.key_to_enc_spacing),
+                  ('layer', tc.layer_size_sim, max(tc.slm_first_layer_spacing, tc.interlayer_spacing,
+                                                   tc.last_layer_ccd_spacing))]
+    else:   # K = 0: the key / encoding region propagates straight to the camera
+        checks = [('phase key', tc.phase_key_size_sim, max(tc.key_to_enc_spacing, tc.last_layer_ccd_spacing))]
     for name, size, z in checks:
-        need = size + 2 * spread(z)
+        need = size + 2 * spread_px(tc, z)
         if need > tc.N_sim:
-            lines.append(f'  WARNING: {name} {size} px + 2 x {spread(z)} px spread = {need} px > '
+            lines.append(f'  WARNING: {name} {size} px + 2 x {spread_px(tc, z)} px spread = {need} px > '
                          f'N_sim {tc.N_sim} -- light will wrap around the grid; raise N_sim')
+    # ASM transfer-function aliasing: H's phase chirp is undersampled beyond this distance
+    s = min(tc.wavelength / (2 * tc.sim_dx), 0.999)
+    z_alias = tc.N_sim * tc.asm_pad_factor * tc.sim_dx ** 2 / tc.wavelength * np.sqrt(1 - s * s)
+    if max(_plane_gaps(tc)) > z_alias:
+        lines.append(f'  WARNING: longest gap {1e3 * max(_plane_gaps(tc)):.3g} mm > ASM aliasing limit '
+                     f'{1e3 * z_alias:.3g} mm (N_sim * pad * sim_dx^2 / lambda) -- raise N_sim or asm_pad_factor')
     return '\n'.join(lines)
 
+# Device profiles: physical defaults applied in recompute_derived via _derive, so a --set or a
+# value loaded from a checkpoint always wins. 'sim' = the original sub-wavelength simulation,
+# 'lab' = the real devices (8 um SLM, Basler 5.86 um camera snapped to 6 um).
+# camera_dx None -> camera pixel = sim pixel. N_sim 'auto' -> sized from the geometry + light spread.
+# encoding_patch_scale / encoding_gap_blocks are in SLM px / bin-sized blocks. phase_key_size (SLM px) None ->
+# derived (key = layer size, or 9 x patch at K = 0); a number fixes the key (and the decoder, which follows the key).
+# Lab defaults locked 2026-10-17: 2 um sim px, 24 um encoding px with 72 um gaps, 400 SLM px key, 12 um detectors
+# on a 24 um pitch (one detector width dark), 3 mm between planes. Sim: bin 3, gap 0 (bin 2 before 2026-10-17).
+DEVICE_PROFILES = {
+    'sim': dict(slm_dx=300 * 1e-9,     # = the old 300 * nm, bit-identical
+                sim_per_slm=1, camera_dx=None, pd_size_cam=3, pd_pitch_cam=3,
+                encoding_patch_scale=3, encoding_gap_blocks=0, phase_key_size=None,
+                key_to_enc_spacing=6e-6, slm_first_layer_spacing=6e-6,
+                interlayer_spacing=6e-6, last_layer_ccd_spacing=6e-6, N_sim=256),
+    'lab': dict(slm_dx=8e-6, sim_per_slm=4, camera_dx=6e-6, pd_size_cam=2, pd_pitch_cam=4,
+                encoding_patch_scale=3, encoding_gap_blocks=3, phase_key_size=400,
+                key_to_enc_spacing=3e-3, slm_first_layer_spacing=3e-3,
+                interlayer_spacing=3e-3, last_layer_ccd_spacing=3e-3, N_sim='auto'),
+}
+
+def _int_ratio(a, b, what):
+    '''a / b as an int, raising if it is not (within 1e-6) a whole number.'''
+    q = a / b
+    if q < 1 - 1e-6 or abs(q - round(q)) > 1e-6:
+        raise ValueError(f'{what}: {a:.4g} / {b:.4g} = {q:.4f} is not a whole number')
+    return int(round(q))
+
+def spread_sine(tc):
+    '''Sine of the widest propagation angle that carries real light: the grid's own limit, or
+    guard_orders diffraction orders of one SLM pixel, whichever is smaller.'''
+    return min(tc.wavelength / (2 * tc.sim_dx), tc.guard_orders * tc.wavelength / tc.slm_dx, 0.999)
+
+def _plane_gaps(tc):
+    '''Propagation distances actually used (no layer gaps at K = 0).'''
+    if tc.num_layers == 0:
+        return [tc.key_to_enc_spacing, tc.last_layer_ccd_spacing]
+    return [tc.key_to_enc_spacing, tc.slm_first_layer_spacing, tc.interlayer_spacing, tc.last_layer_ccd_spacing]
+
+def spread_px(tc, z):
+    '''Lateral spread in sim px of light travelling z at the spread_sine angle.'''
+    s = spread_sine(tc)
+    return int(np.ceil(z * s / np.sqrt(1 - s * s) / tc.sim_dx))
 
 ENCODING_TILE_NAMES = {'single': '000010000',   # one patch in the centre (original)
                        'x':      '101010101',   # centre + 4 diagonal copies
                        'plus':   '010111010',   # centre + 4 edge copies
-                       'full':   '111111111'}   # all 9 cells (one continuous block at gap 0)
-
+                       'full':   '111111111',   # all 9 cells (one continuous block at gap 0)
+                       'full5':  '1' * 25}      # 5x5 grid of copies (added 2026-10-15)
 
 def encoding_tile_cells(pattern):
-    '''3x3 tile pattern (a name in ENCODING_TILE_NAMES or a 9-char '0'/'1' string,
-    row-major) -> list of (row, col) offsets in {-1, 0, 1} where a patch copy sits.'''
+    '''Tile pattern (a name in ENCODING_TILE_NAMES, or a row-major '0'/'1' string of 9 or 25 chars for
+    a 3x3 or 5x5 grid centred on the original patch) -> list of (row, col) offsets where a patch copy
+    sits: in {-1, 0, 1} for 3x3, {-2, ..., 2} for 5x5.'''
     bits = ENCODING_TILE_NAMES.get(str(pattern).lower(), str(pattern))
-    assert len(bits) == 9 and set(bits) <= {'0', '1'} and '1' in bits, \
-        f"encoding_tile_pattern must be one of {list(ENCODING_TILE_NAMES)} or 9 chars of 0/1, got {pattern!r}"
-    return [(i // 3 - 1, i % 3 - 1) for i, b in enumerate(bits) if b == '1']
-
+    n = int(round(np.sqrt(len(bits))))
+    assert n * n == len(bits) and n in (3, 5) and set(bits) <= {'0', '1'} and '1' in bits, \
+        f"encoding_tile_pattern must be one of {list(ENCODING_TILE_NAMES)} or 9 / 25 chars of 0/1, got {pattern!r}"
+    h = n // 2
+    return [(i // n - h, i % n - h) for i, b in enumerate(bits) if b == '1']
 
 def recompute_derived(tc):
-    '''Recompute everything that depends on other config values. Called at the
-    end of init_params(), after --set overrides (train.py), and after loading a
-    saved config (test.py). See the "Derive unless you set it" block above.'''
-    _migrate_legacy_keys(tc)
+    '''Recompute everything that depends on other config values.'''
+    # ---- device profile: physical pitches / distances (explicit values win) ----
+    tc.device_profile = getattr(tc, 'device_profile', 'sim')
+    assert tc.device_profile in DEVICE_PROFILES, \
+        f'unknown device_profile {tc.device_profile!r}, choose from {list(DEVICE_PROFILES)}'
+    for k, v in DEVICE_PROFILES[tc.device_profile].items():
+        if k != 'phase_key_size':                            # design value, derived with the key below
+            _derive(tc, k, v)
 
-    # ---- encoding mode: how the N_alpha harmonics are shown over the M frames ----
-    # 'constant': every phase key sees all Np harmonics (N_alpha = Np) on the input plane 
-    # 'split'   : phase key m shows only harmonics m*Np .. (m+1)*Np-1 (N_alpha = Np*M) on the input plane
-    tc.encoding_mode = getattr(tc, 'encoding_mode', 'constant')
-    tc.split_patch = getattr(tc, 'split_patch', 'frame')  # about the arrangement of Np pixels on the input plane for each key
-    #frame means each key has its own Np harmonic pixels arranged in a contigous block
-    # full mean the input plane has all N_alpha harmonics arranged in a single patch, but only the block for key m is active (the rest are phase 0)
+    # SLM pitch -> sim pitch. Keys AND layers sit on SLM pixels, so both bin by sim_per_slm.
+    # Setting sim_dx directly (or loading an old checkpoint that has it) fixes sim_per_slm instead.
+    if 'sim_dx' in _explicit_set(tc):
+        tc.sim_per_slm = _int_ratio(tc.slm_dx, tc.sim_dx, 'slm_dx / sim_dx')
+    tc.sim_dx = tc.slm_dx / tc.sim_per_slm
+    # old configs carried a separate layer pitch; every run so far had it equal to the SLM pitch
+    if 'layer_dx' in _explicit_set(tc) and abs(tc.layer_dx / tc.slm_dx - 1) > 1e-6:
+        raise ValueError(f'layer_dx {tc.layer_dx:.4g} != slm_dx {tc.slm_dx:.4g} (layers sit on SLM pixels)')
+    tc.layer_dx = tc.slm_dx
+
+    # Camera pitch -> sim pitch; detector size / pitch are whole camera pixels
+    if tc.camera_dx is None:
+        tc.camera_dx = tc.sim_dx
+    tc.cam_bin = _int_ratio(tc.camera_dx, tc.sim_dx, 'camera_dx / sim_dx')
+    _legacy_pd = {'photodiode_size', 'pd_row_spacing', 'pd_col_spacing'} & _explicit_set(tc)
+    if _legacy_pd:
+        # detector size given in metres (old checkpoint / old --set): rounded to sim px as before
+        tc.photodiode_pixels = round(tc.photodiode_size / tc.sim_dx)
+        tc.pd_row_spacing_px = round(tc.pd_row_spacing / tc.sim_dx)
+        tc.pd_col_spacing_px = round(tc.pd_col_spacing / tc.sim_dx)
+    else:
+        tc.photodiode_pixels = tc.pd_size_cam * tc.cam_bin
+        tc.pd_row_spacing_px = tc.pd_col_spacing_px = tc.pd_pitch_cam * tc.cam_bin
+        tc.photodiode_size = tc.photodiode_pixels * tc.sim_dx
+        tc.pd_row_spacing = tc.pd_col_spacing = tc.pd_row_spacing_px * tc.sim_dx
+
+    tc.encoding_mode = getattr(tc, 'encoding_mode', 'constant') # const vs split
     assert tc.encoding_mode in ('constant', 'split'), f'unknown encoding_mode {tc.encoding_mode!r}'
-    assert tc.split_patch in ('frame', 'full'), f'unknown split_patch {tc.split_patch!r}'
-    if tc.encoding_mode == 'split':
-        assert getattr(tc, 'C', 1) == 1, "encoding_mode='split' needs C == 1 (one frame per key)"
     tc.N_alpha = tc.Np * (tc.M if tc.encoding_mode == 'split' else 1)
 
-    # ---- design values: derived from formulas unless explicitly set --------
-    # N = r*2*N_alpha*Nf: 'split' grows with M through N_alpha; scale_layer_with_M
-    # (constant mode only) multiplies by M explicitly.
-    _derive(tc, 'N_trainable_features', int(np.ceil(
-        tc.r * 2 * tc.N_alpha * tc.Nf
-        * (tc.M if tc.scale_layer_with_M and tc.encoding_mode == 'constant' else 1))))
-    _derive(tc, 'layer_size', int(np.ceil(np.sqrt(tc.N_trainable_features / tc.num_layers))))
-    # phase_key_size is derived further down (it needs the encoding geometry)
+    _derive(tc, 'N_trainable_features', int(np.ceil( tc.r * 2 * tc.N_alpha * tc.Nf * (tc.M if tc.scale_layer_with_M and tc.encoding_mode == 'constant' else 1))))
+    _derive(tc, 'layer_size', int(np.ceil(np.sqrt(tc.N_trainable_features / tc.num_layers))) if tc.num_layers > 0 else 0)
 
-    # detector grid: sqrt(Nf) x sqrt(Nf); if only one side is set, the other is Nf / that side
-    explicit = _explicit_set(tc)
-    if 'pd_num_rows' in explicit and 'pd_num_cols' not in explicit:
-        _derive(tc, 'pd_num_cols', tc.Nf // tc.pd_num_rows)
-    elif 'pd_num_cols' in explicit and 'pd_num_rows' not in explicit:
-        _derive(tc, 'pd_num_rows', tc.Nf // tc.pd_num_cols)
-    elif 'pd_num_rows' not in explicit:
-        side = int(np.round(np.sqrt(tc.Nf)))
-        if side * side != tc.Nf:
-            raise ValueError(f'Nf={tc.Nf} is not a perfect square -- pass pd_num_rows and/or '
-                             f'pd_num_cols via --set (their product must equal Nf)')
-        _derive(tc, 'pd_num_rows', side)
-        _derive(tc, 'pd_num_cols', side)
+    # detector grid: always sqrt(Nf) x sqrt(Nf), one detector per target function (Nf must be a perfect square)
+    side = int(np.round(np.sqrt(tc.Nf)))
+    if side * side != tc.Nf:
+        raise ValueError(f'Nf={tc.Nf} is not a perfect square (detector grid is sqrt(Nf) x sqrt(Nf))')
+    tc.pd_num_rows = tc.pd_num_cols = side
 
     # ---- pure geometry: always recomputed -----------------------------------
-    tc.photodiode_pixels = round(tc.photodiode_size / tc.sim_dx)
-
-    tc.pd_row_spacing_px = round(tc.pd_row_spacing / tc.sim_dx)
-    tc.pd_col_spacing_px = round(tc.pd_col_spacing / tc.sim_dx)
-
-    tc.layer_bin      = round(tc.layer_dx / tc.sim_dx)
+    tc.layer_bin      = tc.sim_per_slm                       # one layer pixel per SLM pixel
     tc.layer_size_sim = tc.layer_size * tc.layer_bin
 
     # ---- new NFA (function-approximation) derived params ------------------
-    # Encoding-plane geometry: the patch's pixels arranged as a rows x cols grid, the
-    # factorization closest to square (rows <= cols): square counts give the paper's
-    # sqrt x sqrt patch (Sec. 2.2), e.g. 6 -> 2 x 3, 12 -> 3 x 4, a prime p -> 1 x p.
-    # Pixels share the SLM's physical pixel pitch.
-    # Unlike layer_size/phase_key_size/the spacings, encoding_dx IS recomputed here
-    # (not just at init_params()) so `--set encoding_patch_scale=...` alone is
-    # enough -- no separate encoding_dx/encoding_bin override needed.
-    tc.encoding_dx        = tc.slm_dx * tc.encoding_patch_scale
-    tc.encoding_bin       = round(tc.encoding_dx / tc.sim_dx)
-    # patch pixels: Np, except split_patch='full' (all N_alpha pixels, only frame m's block active)
-    n_pix = tc.N_alpha if (tc.encoding_mode == 'split' and tc.split_patch == 'full') else tc.Np
+    # Encoding-plane geometry: the patch's pixels arranged as a rows x cols grid, chooses factorization closest to square
+    tc.encoding_dx        = tc.slm_dx * tc.encoding_patch_scale   # encoding_patch_scale = SLM px per encoding px
+    tc.encoding_bin       = _int_ratio(tc.encoding_dx, tc.sim_dx, 'encoding_dx / sim_dx')
+    # patch pixels: always Np (split mode shows a new Np-pixel block on the same patch every frame)
+    n_pix = tc.Np
     tc.encoding_rows = max(d for d in range(1, int(np.sqrt(n_pix)) + 1) if n_pix % d == 0) # computes the optimal factorization for rows x cols (largest integer # of rows < sqrt(n_pix) )
     tc.encoding_cols = n_pix // tc.encoding_rows
 
     _g = tc.encoding_gap_blocks
     tc.encoding_y_num_sim = tc.encoding_bin * (tc.encoding_rows + (tc.encoding_rows - 1) * _g) # height in sim px of one patch copy (including gaps)
     tc.encoding_x_num_sim = tc.encoding_bin * (tc.encoding_cols + (tc.encoding_cols - 1) * _g) # width in sim px of one patch copy (including gaps)
-    # Patch copies: neighbouring copies sit one patch + one gap apart along each axis (gap 0 ->
-    # touching), so they continue the pixel lattice. extent = larger of the total height / width.
-    _cells = encoding_tile_cells(getattr(tc, 'encoding_tile_pattern', 'single')) # list of (row, col) offsets in {-1, 0, 1} where a patch copy sits
+    # Patch copies: neighbouring copies sit one patch + one gap apart along each axis (gap 0 -> touching)
+    _cells = encoding_tile_cells(getattr(tc, 'encoding_tile_pattern', 'single')) # list of (row, col) offsets (3x3: {-1, 0, 1}, 5x5: {-2..2}) where a patch copy sits
     _ry = max(abs(r) for r, _ in _cells); _rx = max(abs(c) for _, c in _cells) # furthest copy from the centre along each axis
     tc.encoding_extent_sim = max(
         tc.encoding_y_num_sim + 2 * _ry * (tc.encoding_y_num_sim + tc.encoding_bin * _g),
         tc.encoding_x_num_sim + 2 * _rx * (tc.encoding_x_num_sim + tc.encoding_bin * _g)) # total extent in sim px of all patch copies in input plane
 
     # Phase key. Default width = one layer (layer_size_sim). phase_key_patch_multiple = X
-    # instead sizes it as X x the encoding patch width (the 2026-10-06 default was 2x, from
-    # the Nf=100 key-size sweeps, SWEEP_HANDOVER 4y/4z; reverted 2026-10-07 because at
-    # Nf=1024 the layer-size key was far better, 4aa/4bb). phase_key_bin_scale > 1 bins
-    # the key: each key pixel covers phase_key_bin x phase_key_bin sim px at the SAME
-    # physical width (~scale^2 fewer key params), rounded up until the key's bin grid lines
-    # up with the encoding patch's pixel grid (both are centered in N_sim) -- at z=0 the
-    # key and encoding phases add pixel by pixel.
-    scale = getattr(tc, 'phase_key_bin_scale', 1)
-    tc.phase_key_bin = round(tc.slm_dx / tc.sim_dx) * scale
+    # instead sizes it as X x the encoding patch width
+    tc.phase_key_bin = tc.sim_per_slm                        # one key pixel per SLM pixel
+    # A device profile can fix the key size (lab: 400 SLM px); phase_key_patch_multiple still overrides it
+    profile_key = DEVICE_PROFILES[tc.device_profile].get('phase_key_size')
+    # K = 0: there is no layer size to copy, so the key defaults to 9 x the encoding patch width
+    # (~3 x the full 3x3 tile block, enough to modulate every patch copy) unless set explicitly
+    if profile_key is None and tc.num_layers == 0 and getattr(tc, 'phase_key_patch_multiple', None) is None:
+        tc.phase_key_patch_multiple = 9
     mult = getattr(tc, 'phase_key_patch_multiple', None)
-    key_width_sim = tc.layer_size_sim if mult is None else round(mult * tc.encoding_x_num_sim)
-    n_key = -(-key_width_sim // tc.phase_key_bin)          # key px covering that width
-    if scale > 1:
-        b = tc.phase_key_bin
-        enc_off = (tc.N_sim - tc.encoding_x_num_sim) // 2
-        if tc.encoding_bin % b == 0:
-            for _ in range(2 * b):
-                if ((tc.N_sim - n_key * b) // 2 - enc_off) % b == 0:
-                    break
-                n_key += 1
+    if mult is None and profile_key is not None:
+        n_key = int(profile_key)
+    else:
+        key_width_sim = tc.layer_size_sim if mult is None else round(mult * tc.encoding_x_num_sim)
+        n_key = -(-key_width_sim // tc.phase_key_bin)      # key px covering that width
     _derive(tc, 'phase_key_size', n_key)
     tc.phase_key_size_sim = tc.phase_key_size * tc.phase_key_bin
 
-    # Detector array: one intensity detector per target function (no more
-    # positive/negative differential pairing -- see photodiode section below).
+    # Decoder (E+D architecture, model.py): learnable phase on the encoding plane's non-encoding SLM pixels,
+    # decoder_size SLM px per side (None -> the phase key size)
+    tc.decoder = bool(getattr(tc, 'decoder', False))
+    if tc.decoder:
+        tc.decoder_size_px = int(tc.decoder_size) if getattr(tc, 'decoder_size', None) else int(tc.phase_key_size)
+        tc.decoder_size_sim = tc.decoder_size_px * tc.phase_key_bin
+
     assert tc.pd_num_rows * tc.pd_num_cols == tc.Nf, (
         'photodiode array size (pd_num_rows * pd_num_cols) must equal Nf '
         '-- one detector per target function'
@@ -283,14 +285,17 @@ def recompute_derived(tc):
     tc.num_photodiodes = tc.pd_num_rows * tc.pd_num_cols
 
     # total number of learnable phase-key masks
-    tc.T = int(getattr(tc, 'M', 1) * getattr(tc, 'C', 1))
-    # Keep run_name (and everything derived from it) in sync with M/C/spacings/etc --
-    # train.py's main() calls recompute_derived() right after applying --set overrides,
-    # before training starts, so this must be refreshed here too (init_params() alone
-    # only captures the *default* values in the name/paths).
+    tc.T = int(tc.M)                                        # one frame per phase key
+
+    # N_sim 'auto': largest plane + light spread over the longest gap on both sides, rounded up to 64
+    if tc.N_sim == 'auto':
+        det_span = (tc.pd_num_rows - 1) * tc.pd_row_spacing_px + tc.photodiode_pixels
+        biggest = max(tc.phase_key_size_sim, tc.layer_size_sim, tc.encoding_extent_sim, det_span,
+                      tc.decoder_size_sim if tc.decoder else 0)
+        need = biggest + 2 * spread_px(tc, max(_plane_gaps(tc)))
+        tc.N_sim = int(-(-need // 64) * 64)
     tc.run_name = _build_run_name(tc)
     _build_log_paths(tc)
-
 
 def init_params():
     tc = ConfigObj()
@@ -299,215 +304,114 @@ def init_params():
     #  Physical constants & optical parameters                            #
     # ------------------------------------------------------------------ #
     nm, um, mm, cm = 1e-9, 1e-6, 1e-3, 1e-2
-
     tc.wavelength = 550 * nm 
     tc.ridx_air   = 1.0
-
-    tc.pixel_pitch = 300 * nm               # PAPER (Sec. 2.2): "lateral pitch
-                                            # delta of 300nm (~0.55*lambda)".
-                                            # Shared pitch for input pixels,
-                                            # output pixels, AND diffractive-
-                                            # layer feature width (all == delta
-                                            # in the paper) -- see below.
-
     # ------------------------------------------------------------------ #
-    #  Simulation grid                                                    #
-    #  sim_dx == pixel_pitch so every *_bin factor below is exactly 1 (no #
-    #  oversampling anywhere) -- needed to resolve the paper's sub-micron  #
-    #  features at all. N_sim=256 gives a ~7.5x guard band around the     #
-    #  largest single-plane aperture (~34px, see layer_size below) to     #
-    #  avoid FFT wrap-around, while staying cheap (this is a MUCH smaller #
-    #  grid than the old 2000x2000 -- the paper's whole system lives on a #
-    #  compact, sub-100um scale, not the cm scale of the old benchtop      #
-    #  hardware model this file used to describe).                        #
+    #  Device profile & simulation grid                                  #
     # ------------------------------------------------------------------ #
-    tc.sim_dx = tc.pixel_pitch
-    tc.N_sim  = 256
+    # 'sim' (300 nm SLM = sim pixel, 6 um gaps, N_sim 256) or 'lab' (8 um SLM, 1 um sim px,
+    # 6 um camera, 2 mm gaps, N_sim auto). The profile fills slm_dx, sim_per_slm (sim px per
+    # SLM px; sim_dx = slm_dx / sim_per_slm), camera_dx, pd_size_cam, pd_pitch_cam, the four
+    # spacings and N_sim -- see DEVICE_PROFILES. Any of them can still be --set individually.
+    tc.device_profile = 'sim'
+    tc.guard_orders   = 2   # light spread assumed up to this many diffraction orders of one SLM pixel (N_sim auto + wrap warning)
     tc.asm_pad_factor = 1
     tc.r = 1.25 # scaling factor of the diffractive layer's feature count
 
     # ------------------------------------------------------------------ #
-    #  Nonlinear function approximation -- targets & input encoding       #
-    #  See Rahman et al. eLight (2025) 5:32, Sec. 2.1/2.2/4.1.             #
+    #  Nonlinear function targets & input encoding                       #
     # ------------------------------------------------------------------ #
     tc.Np = 9                    # number of input-encoding pixels
     tc.Nf = 100                  # Number of functions = number of detectors
     tc.a_min = -0.5               #input domain of a
     tc.a_max = 0.5                
 
-    tc.encoding_freq_step = 1     # NOTE: not specified in paper as a separate
-                                  # hyperparameter -- implicit in their
-                                  # phi_in(p;a) = 2*pi*(p-1)*a, i.e. alpha_p =
-                                  # (p-1)*encoding_freq_step with step fixed
-                                  # at 1 (Sec. 4.1: "alpha_p = p - 1"). Exposed
-                                  # here in case we ever want to change it.
+    tc.encoding_freq_step = 1     # phi_in(p;a) = 2*pi*encoding_freq_step*(p-1)*a
+    # encoding_patch_scale (binning: each p value takes up bin x bin SLM pixels) and encoding_gap_blocks (zero-phase
+    # bin-sized blocks between adjacent encoding pixels) come from the device profile (sim: 2 / 0, lab: 3 / 3).
+    # Harmonic p sits at row p // cols, column p % cols of the rows x cols patch (p = 0 top-left).
 
-    tc.encoding_opaque_background = False  
-
-    tc.encoding_patch_scale = 2   # binning of the input pixels, 
-                                  # each p value takes up encoding_patch_scale x
-                                  # encoding_patch_scale simulation pixels
-
-    tc.encoding_gap_blocks = 0    # Number of BLANK bin-sized blocks
-                                  # inserted between adjacent encoding pixels,
-                                  # in both row and column directions -- each
-                                  # blank block is the same physical size as
-                                  # one pixel's own encoding_bin x
-                                  # encoding_bin block, so at patch_scale=2 a
-                                  # gap of 1 is itself a 2x2 blank block
-                                  # separating 2x2 pixel blocks.
-
-    # Harmonic p sits at row p // cols, column p % cols of the rows x cols patch (raster,
-    # p = 0 top-left). 
-
-    # Identical copies of the encoding patch on a 3x3 grid around the centre (2026-10-09).
-    # 'single' (centre only, original), 'x' (centre + diagonals), 'plus' (centre + edges), 'full' (all 9),
-    # or any 9-char row-major '0'/'1' string, e.g. '101010101' == 'x'. Copies are one
-    # patch + one gap apart (touching at gap 0); see recompute_derived / encoding_tile_cells.
-    tc.encoding_tile_pattern = 'single'
-
-    # Encoding mode (2026-10-09): how the harmonics are spread over the M phase keys.
-    #   'constant': every frame shows all Np harmonics; N_alpha = Np (PAPER: Nalpha = Np).
-    #   'split'   : frame m shows only harmonics m*Np .. (m+1)*Np-1; N_alpha = Np*M, so
-    #               N = r*2*N_alpha*Nf grows with M. Pixels not shown are phase 0.
-    # split_patch (split only): 'frame' = one Np-pixel patch rewritten every frame;
-    #   'full' = an N_alpha-pixel patch where only frame m's block is active, the rest phase 0.
-    tc.encoding_mode = 'constant'
-    tc.split_patch = 'frame'
-
-    tc.func_seed = 0              # random seed for generating Nf target functinons
+    tc.encoding_tile_pattern = 'full'   # 'full' (default since 2026-10-17) copies the patch to a 3x3 grid around the centre, 'single' = one patch, 'full5' = 5x5 grid
+    tc.encoding_mode = 'constant'       # how harmonics are spread over the M keys (constant: all keys see all Np harmonics; split: key m sees only block of harmonics Np = m*Np .. (m+1)*Np-1)
+                                        # const: N_alpha = Np; split: N_alpha = Np*M and N = r*2*N_alpha*Nf grows with M
+    tc.func_seed = 0                    # random seed for generating Nf target functinons
 
     # ------------------------------------------------------------------ #
-    #  Diffractive Layers                                                 #
-    #  Each layer is shared across all M time-multiplexed phase keys      #
-    #  (unchanged role/mechanism from before).                             #
-    #  PAPER (Sec. 2.2): K=2 surfaces (their main/default design; K=4 is a #
-    #  deeper alternative shown to further reduce error, Fig. 3/4), with   #
-    #  N ~= r * 2*Np*Nf trainable features total, distributed evenly    #
-    #  over the K surfaces -- this sets layer_size (features per side of   #
-    #  a square layer). This is a GUIDELINE, not a strict requirement      #
-    #  (paper's own wording). N_trainable_features and layer_size are      #
-    #  DERIVED in recompute_derived() from the current Np/Nf/K/M/r, unless #
-    #  you --set them explicitly (then your value sticks).                 #
+    #  Diffractive Layers                                                #
     # ------------------------------------------------------------------ #
-    tc.M             = 1   # NOTE: not defined in paper -- number of learned
-                           # phase keys (time-multiplexed conditioning masks).
-
-    tc.num_layers    = 2   # PAPER (Sec. 2.2): K
+    tc.M             = 1   # number of phase keys
+    tc.num_layers    = 2   
     tc.scale_layer_with_M = False  # N = r * 2*Np*Nf*M  (True) or N = r * 2*Np*Nf (False)
-    tc.layer_dx      = tc.pixel_pitch  # PAPER: diffractive feature width == delta
-    # derived in recompute_derived(): N_trainable_features, layer_size, layer_bin, layer_size_sim
+    # layers sit on SLM pixels (layer pitch = slm_dx)
 
     # ------------------------------------------------------------------ #
-    #  Phase-key plane  (hardware device -- same SLM as before, new role) #
-    #  NOTE: the M-key / "wisdom of the crowd" time-multiplexing idea is  #
-    #  OUR OWN addition on top of the paper -- the paper has no phase-key #
-    #  plane or per-key ensembling concept, so M's role/value below is    #
-    #  not paper-derived.                                                 #
-    #                                                                      #
-    # Phase-key width = one layer (layer_size), unless phase_key_patch_   #
-    # multiple is set (see recompute_derived).                             #
+    #  Phase-key plane                                                   #   
     # ------------------------------------------------------------------ #
-    tc.slm_dx      = tc.pixel_pitch
     tc.phase_key_patch_multiple = None  # None: key = layer size; X: key = X x encoding patch width
-    tc.phase_key_bin_scale = 1   # >1 bins key pixels (bin x bin sim px each), keeping the
-                                 # key's physical size -> ~bin^2 fewer key params
-    # derived in recompute_derived(): phase_key_size (= layer_size_sim / phase_key_bin, or
-    # phase_key_patch_multiple x encoding_x_num_sim / phase_key_bin, unless --set),
-    # phase_key_bin, phase_key_size_sim
 
-    tc.slm_hw_x      = 1920  # NOTE: real-device pixel count, non-binding at
-    tc.slm_hw_y      = 1080  # this scale (bigger than N_sim -- gets clipped
-                              # to N_sim in model.py, i.e. no additional
-                              # aperture restriction beyond the sim window).
+    tc.slm_hw_x      = 1920  # real-device pixel count
+    tc.slm_hw_y      = 1080  
     tc.slm_bit_depth = 8
+
+    # ------------------------------------------------------------------ #
+    #  Decoder at the encoding plane (E+D architecture)                  #
+    # ------------------------------------------------------------------ #
+    tc.decoder      = False   # True: train a phase mask on every non-encoding SLM pixel of the encoding plane
+    tc.decoder_size = None    # SLM px per side; None -> phase_key_size
+    tc.decoder_over_encoding = False  # True: decoder also trains on the encoding pixels (every pixel of its square; superset of False)
 
     tc.mask_init_method = 'normal'
     tc.mask_init_std   = 1
 
-
     # ------------------------------------------------------------------ #
-    #  Function-input encoding plane (deterministic, NOT learned)         #
-    #  Replaces the old "Object (MNIST phase images)" plane below --      #
-    #  instead of an image, this plane carries phi_in(p;a) = 2*pi *       #
-    #  encoding_freq_step * (p-1) * a for p = 1..Np (PAPER Sec. 2.2/4.1).  #
+    #  Distances between planes                                          #
     # ------------------------------------------------------------------ #
-    # derived in recompute_derived(): encoding_dx (= slm_dx * encoding_patch_scale;
-    # PAPER's 1:1 pitch at patch_scale=1), encoding_bin, encoding_rows / encoding_cols,
-    # encoding_y_num_sim / encoding_x_num_sim, encoding_extent_sim
-    #
-    # the paper's layer_size-scaled formula.
-    # _W = tc.layer_size * tc.layer_dx
-    # _z = _W * np.sqrt((2 * tc.pixel_pitch / tc.wavelength) ** 2 - 1)
-    _z = 6e-6
-    tc.key_to_enc_spacing      = _z   # phase-key -> encoding-plane spacing (NOTE, no paper analogue)
-    # When key_to_enc_spacing == 0, skip the propagator and form the encoding-plane field as exactly exp(j*(phi_key + phi_encoding)) 
+    # key_to_enc_spacing, slm_first_layer_spacing, interlayer_spacing, last_layer_ccd_spacing
+    # come from the device profile. key_to_enc_spacing = 0 adds the key phase directly to the
+    # input encoding phase, exp(1j*(phi_key + phi_in))
     tc.key_to_enc_exact_at_zero = True
-    tc.interlayer_spacing      = _z   # PAPER
-    tc.slm_first_layer_spacing = _z   # PAPER (encoding-plane -> first-layer spacing)
-    tc.last_layer_ccd_spacing  = _z   # PAPER (last-layer -> detector spacing)
 
     # ------------------------------------------------------------------ #
-    #  Photodiode array  (pd_num_rows x pd_num_cols detectors)             #
-    #  ONE intensity detector per target function -- detector (r,c) reads #
-    #  out f_hat_k(a) for k = r*pd_num_cols + c, via direct min-max        #
-    #  normalization (PAPER Eq. 9), no positive/negative differential      #
-    #  pairing anymore. pd_num_rows * pd_num_cols must equal tc.Nf (asserted  #
-    #  in recompute_derived).                                              #
+    #  Photodiode array                                                  #
     # ------------------------------------------------------------------ #
+    # Detector size / centre-to-centre pitch are whole camera pixels (pd_size_cam, pd_pitch_cam,
+    # from the profile; equal -> adjacent detectors touch). photodiode_size / pd_row_spacing /
+    # pd_col_spacing in metres are derived for display; --set-ting them (as old configs did)
+    # overrides the camera-pixel values.
 
-    tc.photodiode_size = 3 * tc.pixel_pitch   # detector width (3 sim pixels)
-    tc.pd_row_spacing  = 3 * tc.pixel_pitch   # center-to-center pitch, row direction (3 px)
-    tc.pd_col_spacing  = 3 * tc.pixel_pitch   # center-to-center pitch, column direction (3 px)
-    # derived in recompute_derived(): pd_num_rows/pd_num_cols (= sqrt(Nf) unless
-    # --set), photodiode_pixels, pd_row/col_spacing_px, num_photodiodes
-
-    # Offset of the whole array's center, in sim-grid pixels relative to the optical
-    # axis (N_sim/2). Default 0 centers the array on the axis. Nonzero shifts the
-    # whole array (e.g. to model misalignment).
+    # Offset detector array's center, relative to optical axis (in sim pixels)
     tc.detector_offset_y = 0
     tc.detector_offset_x = 0
 
     # ------------------------------------------------------------------ #
-    #  Nonlinear function approximation -- sampling of `a`. #
+    #  Nonlinear function approximation -- sampling of `a`.              #
     # ------------------------------------------------------------------ #
-    tc.train_a_samples = 10000  # number of training samples of a
-    tc.val_a_grid_size  = 1000   # number of validation samples of a (grid)
-    tc.test_a_grid_size = 1000  # number of test samples of a (grid)
+    tc.train_a_samples = 10000  
+    tc.val_a_grid_size  = 1000  
+    tc.test_a_grid_size = 1000 
 
     # ------------------------------------------------------------------ #
-    #  Training hyper-parameters                                          #
+    #  Training hyper-parameters                                         #
     # ------------------------------------------------------------------ #
     tc.batch_size       = 64
     tc.test_batch_size  = 4
     tc.max_epoch        = 150
     tc.seed             = 59
-
     tc.num_workers = 0
-
     tc.lr_slm     = 1e-2   # learning rate for the phase-key plane
     tc.lr_layer   = 1e-2   # learning rate for the diffractive layers
-
+    tc.lr_decoder = 1e-2   # learning rate for the encoding-plane decoder (only used when decoder = True)
     tc.slm_warmup_epochs = 0
-
-    # End-to-end measurement-noise injection (SLM + decoder co-adapt to the sim->real gap).
-    tc.meas_noise_std = 0
-
-    tc.freeze_slm = False  # freezes the phase-key plane (was: SLM mask)
-                                          #
-    # ------------------------------------------------------------------ #
-    tc.loss_type = 'mse'      
+    tc.meas_noise_std = 0  # End-to-end measurement-noise injection (SLM + decoder co-adapt to the sim->real gap).
+    tc.freeze_slm = False 
+    tc.loss_type = 'mse'
 
     # ------------------------------------------------------------------ #
-    #  Logging & checkpoints        #
+    #  Logging & checkpoints                                             #
     # ------------------------------------------------------------------ #
-    tc.checkpoint_save  = 10
+    tc.checkpoint_save  = 10 # every (checkpoint_save) epochs, save a checkpoint (model + config)
     tc.checkpoint_print = 1
-
-    tc.ckpt_to_load = None  # path to a checkpoint to load (None = start from scratch)
-
-    # When loading ckpt_to_load, load ONLY the model weights (skip epoch/optimizer/scheduler) so
-    # training starts a fresh fine-tune from epoch 0 with a new LR schedule. False = resume.
+    tc.ckpt_to_load = None 
     tc.load_weights_only = False
 
     tc._explicit = set()    # keys set via --set / a loaded checkpoint (never re-derived)

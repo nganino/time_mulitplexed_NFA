@@ -6,11 +6,12 @@ Usage:
     python train.py --set freeze_slm=true
     python train.py --set M=5 lr_slm=5e-3
     python train.py --set Np=25 Nf=1024 num_layers=3 M=2   # sizes follow automatically
-    python train.py --set Nf=200 pd_num_cols=20             # non-square Nf: give one side
+    python train.py --set device_profile=lab                # 8 um SLM, 6 um camera, 1 um sim px
+    python train.py --set device_profile=lab sim_per_slm=4 last_layer_ccd_spacing=1e-3
     python train.py --set encoding_mode=split Np=9 M=4      # 36 harmonics, 9 per frame
 
 --set KEY=VALUE overrides any config.py value. Design values (layer_size,
-phase_key_size, N_trainable_features, pd_num_rows/cols) are re-derived from their
+phase_key_size, N_trainable_features) and the device-profile values are re-derived from their
 formulas after the overrides are applied -- unless you --set them yourself, in
 which case your value sticks. The derived values are printed (and written to
 LOG.txt) at startup, tagged [set] or [derived]. See config.py "Derive unless you
@@ -44,7 +45,7 @@ import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 
-from config import (init_params, recompute_derived, config_to_dict, LEGACY_ALIASES,
+from config import (init_params, recompute_derived, config_to_dict,
                     mark_explicit, describe_design)
 from model import TimeMultiplexedNFA
 from dataloader import get_function_approx_dataloaders
@@ -57,15 +58,14 @@ def _apply_overrides(config, overrides):
     '''Apply KEY=VALUE strings to config, preserving the original type.'''
     for kv in overrides:
         key, val_str = kv.split('=', 1)
-        if key in LEGACY_ALIASES:
-            print(f'  Note: --set {key} is a renamed key, using {LEGACY_ALIASES[key]}')
-            key = LEGACY_ALIASES[key]
         if not hasattr(config, key):
             raise ValueError(
                 f"--set {key}={val_str}: '{key}' is not a config attribute "
             )
         current = getattr(config, key, None)
-        if isinstance(current, bool):
+        if val_str == 'auto':                       # e.g. N_sim=auto (sized from the geometry)
+            val = val_str
+        elif isinstance(current, bool):
             val = val_str.lower() in ('true', '1', 'yes')
         elif isinstance(current, int):
             val = int(float(val_str))
@@ -102,6 +102,12 @@ class TimeMultiplexedNFATrainer:
         self.criterion = FunctionApproxLoss(config).to(self.device)
         (self.opt_slm, self.opt_layers, self.opt_readout,
          self.sched_slm, self.sched_layers, self.sched_readout) = self._init_optimizers()
+        # Decoder (E+D, model.py): own Adam + cosine schedule, only when config.decoder is on
+        self.opt_decoder = self.sched_decoder = None
+        if self.model.decoder:
+            self.opt_decoder = torch.optim.Adam([self.model.decoder_phases], lr=config.lr_decoder, betas=(0.9, 0.999))
+            self.sched_decoder = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.opt_decoder, T_max=config.max_epoch, eta_min=1e-5)
 
         if config.ckpt_to_load is not None:
             print(f'Loading checkpoint: {config.ckpt_to_load}')
@@ -119,6 +125,9 @@ class TimeMultiplexedNFATrainer:
               f' = {model.T * self.config.phase_key_size ** 2:,} params')
         print(f'  Layers     : {model.num_layers} x {self.config.layer_size}^2'
               f' = {model.num_layers * self.config.layer_size ** 2:,} params')
+        if model.decoder:
+            print(f'  Decoder    : {model.decoder_size}^2 SLM px, {int(model.decoder_mask.sum().item()) // model.phase_key_bin ** 2:,}'
+                  f' trainable SLM px')
         return model
 
     def _init_optimizers(self):
@@ -137,8 +146,7 @@ class TimeMultiplexedNFATrainer:
                 opt_slm, T_max=self.config.max_epoch, eta_min=1e-5
             )
 
-        # Diffractive layers are always trainable now (num_layers > 0 is
-        # required, see model.py) -- no more conditional creation.
+        # Diffractive layers (an empty parameter at K = 0, so this optimizer is then a no-op).
         opt_layers = torch.optim.Adam(
             [self.model.layer_phases], lr=self.config.lr_layer, betas=(0.9, 0.999)
         )
@@ -180,6 +188,8 @@ class TimeMultiplexedNFATrainer:
             self.opt_slm.zero_grad(set_to_none=True)
         self.opt_layers.zero_grad(set_to_none=True)
         self.opt_readout.zero_grad(set_to_none=True)
+        if self.opt_decoder is not None:
+            self.opt_decoder.zero_grad(set_to_none=True)
 
         I_vec = self.model(a)
         loss, _ = self.criterion(I_vec, target)
@@ -194,6 +204,8 @@ class TimeMultiplexedNFATrainer:
             self.opt_slm.step()
         self.opt_layers.step()
         self.opt_readout.step()
+        if self.opt_decoder is not None:
+            self.opt_decoder.step()
 
         return loss.item(), slm_gnorm, layer_gnorm
 
@@ -282,6 +294,8 @@ class TimeMultiplexedNFATrainer:
             'sched_layers': self.sched_layers.state_dict(),
             'opt_readout'  : self.opt_readout.state_dict(),
             'sched_readout': self.sched_readout.state_dict(),
+            'opt_decoder'  : self.opt_decoder.state_dict()   if self.opt_decoder   else None,
+            'sched_decoder': self.sched_decoder.state_dict() if self.sched_decoder else None,
         }
 
     def save(self, max_keep=5):
@@ -350,6 +364,14 @@ class TimeMultiplexedNFATrainer:
                 self.sched_readout.load_state_dict(ckpt['sched_readout'])
             except (ValueError, RuntimeError) as e:
                 print(f'  [warning] sched_readout state skipped: {e}')
+
+        for name in ('opt_decoder', 'sched_decoder'):
+            obj = getattr(self, name)
+            if obj is not None and ckpt.get(name) is not None:
+                try:
+                    obj.load_state_dict(ckpt[name])
+                except (ValueError, RuntimeError) as e:
+                    print(f'  [warning] {name} state skipped: {e}')
 
         self.epoch = ckpt['epoch']
         print(f'  Resumed from epoch {self.epoch}')
@@ -481,6 +503,8 @@ def main():
             trainer.sched_slm.step()
         trainer.sched_layers.step()
         trainer.sched_readout.step()
+        if trainer.sched_decoder is not None:
+            trainer.sched_decoder.step()
 
         writer.add_scalar('loss/train',        run_loss,        epoch)
         writer.add_scalar('key_gnorm/train',   run_slm_gnorm,   epoch)

@@ -44,11 +44,8 @@ class FunctionApproxLoss(nn.Module):
         assert self.loss_type == 'mse', f"only 'mse' is implemented, got {self.loss_type!r}"
         self.mse_fn = nn.MSELoss()
 
-        # Learned affine readout: f_hat = I_summed * scale + bias. scale is
-        # parameterized through softplus to stay positive (higher intensity
-        # -> higher f_hat, a monotonic mapping) and numerically stable; both
-        # are trained by backprop like any other parameter (see train.py's
-        # opt_readout). Init: scale=1, bias=0 (raw_scale = softplus^-1(1)).
+        # Learned affine readout: f_hat = I_summed * scale + bias. scale is parameterized through softplus to stay positive (higher intensity
+        # -> higher f_hat, a monotonic mapping) and numerically stable; both are trained by backprop like any other parameter  Init: scale=1, bias=0 (raw_scale = softplus^-1(1)).
         self._raw_scale = nn.Parameter(torch.tensor(0.5413))
         self.bias       = nn.Parameter(torch.zeros(()))
 
@@ -58,18 +55,15 @@ class FunctionApproxLoss(nn.Module):
 
     def _detector_to_function(self, I_vec):
         '''
-        I_vec : [B, T, rows, cols] raw per-detector intensity (model.forward()
-                output, T == M phase keys)
+        I_vec : [B, T, rows, cols] raw per-detector intensity (model.forward() output, T == M phase keys)
         returns [B, Nf] : averaged over T, flattened per-detector -> per-function
         '''
         B = I_vec.shape[0]
-
-        I_integrated = I_vec.mean(dim=1)          # [B, rows, cols]
+        I_integrated = I_vec.mean(dim=1)          # [B, rows, cols] average over M phase keys
         return I_integrated.reshape(B, self.Nf)   # [B, Nf], k = r * cols + c
 
     def normalize(self, I_summed):
-        '''Learned affine transform -- see module-level HISTORY comment for
-        why this replaced an EMA-tracked running Pmin/Pmax.'''
+        '''Learned affine transform to map raw intensity to normalized function values'''
         return I_summed * self.scale + self.bias
 
     def forward(self, I_vec, target):
@@ -101,18 +95,7 @@ class FunctionApproxLoss(nn.Module):
 
         Each I_vec entry is a detector's MEAN intensity over its pd_px x pd_px
         window, so it is multiplied by pd_px^2 to get the energy that detector
-        captures -- otherwise efficiency would not be comparable across
-        detector sizes. Energy lost between detectors (dead space) is NOT
-        counted: this measures light usefully landing on detectors, not total
-        power surviving to the detector plane.
-
-        incident_energy is over the larger of the phase-key and first-layer
-        footprints (see model.incident_energy), so the ratio is independent of
-        N_sim. It is close to, but not strictly, bounded by 1: a little plane-wave
-        light from outside that footprint can still diffract into the layer
-        apertures. (Before 2026-10-07 it was the key footprint only, which gave
-        values > 1 when the key was smaller than the layers.)
-
+        captures 
         returns [B, T] efficiency; average over both axes for a single number
         (sum over detectors and mean over B/T commute).
         '''

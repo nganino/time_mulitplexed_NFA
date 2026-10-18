@@ -46,8 +46,8 @@ class TargetFunctionSet:
         self.alphas = torch.arange(self.N_alpha, dtype=torch.float64) * self.freq_step
 
         gen = torch.Generator().manual_seed(int(config.func_seed))
-        modulus = torch.rand(self.Nf, self.N_alpha, generator=gen, dtype=torch.float64)
-        phase   = torch.rand(self.Nf, self.N_alpha, generator=gen, dtype=torch.float64) * (2 * np.pi)
+        modulus = torch.rand(self.Nf, self.N_alpha, generator=gen, dtype=torch.float64) # uniform distribution in [0, 1]
+        phase   = torch.rand(self.Nf, self.N_alpha, generator=gen, dtype=torch.float64) * (2 * np.pi) # uniform distribution in [0, 2*pi]
         self.coeffs = modulus * torch.exp(1j * phase)   # [Nf, N_alpha] complex128
 
         # ---- global min-max normalization (PAPER Eq. 10) -------------------
