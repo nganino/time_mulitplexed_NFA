@@ -191,9 +191,15 @@ class TimeMultiplexedNFATrainer:
         if self.opt_decoder is not None:
             self.opt_decoder.zero_grad(set_to_none=True)
 
-        I_vec = self.model(a)
-        loss, _ = self.criterion(I_vec, target)
-        loss.backward()
+        # Gradient accumulation: k equal micro-batches, each loss scaled by 1/k, so the summed gradient equals the
+        # full-batch gradient (the loss is a plain mean and nothing depends on the batch) at 1/k of the memory
+        k = int(getattr(self.config, 'grad_accum_steps', 1))
+        assert a.shape[0] % k == 0, f'batch {a.shape[0]} not divisible by grad_accum_steps {k}'
+        loss = 0.0
+        for a_mb, t_mb in zip(a.chunk(k), target.chunk(k)):
+            mb_loss, _ = self.criterion(self.model(a_mb), t_mb)
+            (mb_loss / k).backward()
+            loss = loss + mb_loss.detach() / k
 
         slm_gnorm = (self.model.slm_phases.grad.norm().item()
                      if self.model.slm_phases.grad is not None else 0.0)

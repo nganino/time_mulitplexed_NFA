@@ -1,527 +1,138 @@
 # time-multiplexed-NFA
 
-**NFA = Nonlinear Function Approximation.** This repo optically approximates `Nf`
-independent, arbitrary nonlinear functions `f_k(a)`, k = 1..Nf, of a single scalar
-input `a`, all in parallel, using a diffractive optical processor -- following
-Rahman et al., *"Massively parallel and universal approximation of nonlinear
-functions using diffractive processors,"* eLight (2025) 5:32 (DOI
-10.1186/s43593-025-00113-w) -- **plus one addition of our own**: a learned,
-time-multiplexed **phase-key plane** placed before the input encoding. The idea is
-"wisdom of the crowd": each of `M` phase keys gives one independent (imperfect)
-optical estimate of `f(a)`; averaging the `M` raw detector intensities before
-normalizing is meant to reduce approximation error for a *fixed* set of `Nf`
-functions. This is a different goal from the paper's own time-multiplexing (which
-uses multiple wavelengths to *increase the number* of functions computed in
-parallel, not to improve accuracy on a fixed set).
+**NFA = Nonlinear Function Approximation.** A diffractive optical processor computes `Nf` independent nonlinear
+functions `f_k(a)` of one scalar input `a` in parallel, following Rahman et al., *"Massively parallel and universal
+approximation of nonlinear functions using diffractive processors,"* eLight (2025) 5:32 (DOI 10.1186/s43593-025-00113-w).
 
-This project was pivoted (Sep 2026, in a single working session) from an earlier,
-structurally similar codebase that did time-multiplexed **image classification**
-(MNIST/CIFAR phase objects -> differential photodiode-pair contrast -> softmax
-cross-entropy). That pivot is essentially complete as of this README (config,
-model, loss, dataloader, train, test all rewritten), but see **"Known open
-items"** at the bottom -- there is unresolved training instability, some
-paper-guideline values that were adopted as defaults without dedicated tuning, and
-a couple of pre-existing-but-still-inaccurate leftover comments to be aware of.
+Our additions:
+- **Time multiplexing:** `M` learned phase keys (frames), one per exposure; the detector intensities are averaged over
+  the `M` frames before the readout. More frames add representational capacity, not only noise averaging.
+- **E+D architecture:** a learned decoder phase mask on the encoding plane, shared by all frames. It gives ~10^4x
+  over keys alone at K = 0 and is the paper architecture.
+- **Split encoding:** frame `m` shows only its own block of `Np` harmonics, so `N_alpha = Np * M` harmonics are
+  represented with `Np` pixels per frame.
 
-## Physical architecture
+The experiment log (what was run, what was learned) is `code/logs/SWEEP_HANDOVER.txt`.
+
+## Physical model
 
 ```
-Phase-key plane (LEARNED, T == M keys, time-multiplexed)
-   phi_key ~ sigmoid(slm_phases) * 2*pi          [T, 1, phase_key_size, phase_key_size]
-        |
-        | propagate across key_to_enc_spacing  (FreeSpaceProp)
-        v
-Function-input encoding plane (DETERMINISTIC, NOT learned)
-   phi_in(p; a) = 2*pi * encoding_freq_step * (p-1) * a
-   for p = 1..Np, arranged as an encoding_side x encoding_side square patch
-   (encoding_side = sqrt(Np)); field there = exp(i*phi_key_propagated) * exp(i*phi_in(p;a))
-        |
-        | propagate across slm_first_layer_spacing
-        v
-K learned diffractive layers (shared across all M keys)
-   phi_layer_k ~ sigmoid(layer_phases[k]) * 2*pi   [1, 1, layer_size, layer_size]
-   interleaved with propagation across interlayer_spacing
-        |
-        | propagate across last_layer_ccd_spacing
-        v
-Detector plane: pd_num_rows x pd_num_cols intensity detectors
-   ONE detector per target function: detector (r,c) -> function k = r*pd_num_cols + c
-   pd_num_rows * pd_num_cols MUST equal Nf (asserted in config.recompute_derived)
-        |
-        | (everything above is model.py; everything below is loss.py)
-        v
-Average raw intensity over the M phase keys -> [B, Nf]
-        |
-        v
-Learned affine readout: f_hat = I_summed * scale + bias (scale/bias are
-   nn.Parameters, trained by backprop like everything else -- see "Known
-   open items" for why this replaced an EMA-tracked running Pmin/Pmax)
-        |
-        v
-f_hat(a)  in [0,1]^Nf (approximately; not hard-clamped) <-- compared to the target f(a) via MSE
+phase key m (learned, one per frame)          [M, key, key]  on the SLM
+   | free space, key_to_enc_spacing
+   v
+encoding plane: phi_in(p; a) = 2*pi*p*a on Np pixels (3x3 copies of the patch)
+                + decoder phase (learned, shared by all frames; E+D)
+   | free space, slm_first_layer_spacing (or last_layer_ccd_spacing when K = 0)
+   v
+K learned diffractive layers (shared; K = 0 in the lab setup)
+   | free space, last_layer_ccd_spacing
+   v
+camera: sqrt(Nf) x sqrt(Nf) detectors, detector k -> function k
+   -> mean over the M frames -> learned affine readout (scale, bias) -> f_hat(a), MSE against f(a)
 ```
 
-Both `object_slm_spacing`-style planes from the old classifier (a learned SLM mask,
-then a separate "object" image plane) map directly onto this: the phase-key plane
-plays the SLM's old structural role (learned, propagated, then multiplicatively
-combined with the next plane), and the encoding plane plays the object's old
-structural role (deterministic content, multiplicatively combined) -- **but the
-object's content used to be an image; now it's a formula in `a`.**
+`model.py` returns the raw per-frame detector intensities `[B, M, rows, cols]`; frame averaging, readout and loss
+live in `loss.py`. Targets (`target_functions.py`) are `f_k(a) = |sum_i F_k(alpha_i) exp(j 2 pi alpha_i a)|^2`
+with random `F_k` (paper Eq. 10, seeded by `func_seed`), min-max normalised jointly over all `Nf` functions;
+`alpha_i = 0 .. N_alpha - 1`. Training uses the paper's forward-simulate-and-backprop route, not its closed-form
+Fourier fit: the keys and intensity averaging make the system non-linear in the field.
 
-## Why this can't reuse the paper's efficient training trick
+## Locked defaults (2026-10-17/18)
 
-The paper's own training loss (its Eq. 11) never simulates a specific `a` at all --
-it fits the diffractive stack's coherent point-spread function directly to each
-target function's Fourier coefficients in closed form, because with nothing in
-front of the encoding plane, the system is purely linear (coherent field in, coherent
-field out) and matching coefficients guarantees the fit for *every* `a`
-simultaneously. Our design breaks that shortcut in two ways: (1) the phase-key
-plane sits *before* the encoding plane and gets diffraction-propagated onto it, so
-its effect is a fixed-but-nontrivial per-pixel complex weighting that only becomes
-useful with `M > 1` *different* keys; (2) the `M`-key combination happens by
-averaging **intensities** (post-detection), which is a nonlinear (incoherent)
-combination with no closed-form Fourier-coefficient fit. So training here is
-standard forward-simulate-then-backprop (`loss.py`'s MSE against `target_functions`'
-closed-form values), not the paper's shortcut. This is a deliberate, understood
-trade-off, not an oversight.
+Only `Np`, `Nf`, `M` and the encoding mode are meant to change. `device_profile` selects one of two physical setups
+(`config.py` `DEVICE_PROFILES`); each value can still be `--set`.
 
-## Terminology / glossary
+**Lab** (`device_profile=lab`, the real devices; paper setup with `num_layers=0 decoder=true`):
 
-| term | meaning |
+| plane | parameter | value | sim px (2 um) |
+|---|---|---|---|
+| SLM | pixel (keys, decoder, layers) | 8 um | 4 |
+| camera | pixel | 6 um (Basler 5.86 um, snapped) | 3 |
+| key plane | phase key = decoder | 400 x 400 SLM px = 3.2 mm (fixed by the profile) | 1600 |
+| encoding | pixel (`encoding_patch_scale` 3) | 3 SLM px = 24 um | 12 |
+| encoding | gap (`encoding_gap_blocks` 3) | 9 SLM px = 72 um, also between tile copies | 36 |
+| encoding | 3x3 block, varies with Np | Np 36: 1.66 mm, Np 49: 1.94 mm, Np 64: 2.23 mm | 828 / 972 / 1116 |
+| camera | detector / pitch (`pd_size_cam` 2, `pd_pitch_cam` 4) | 12 um on 24 um (one width dark) | 6 / 12 |
+| camera | detector array, varies with Nf | Nf 100: 0.23 mm, Nf 1024: 0.76 mm | 114 / 378 |
+| distances | key->encoding, encoding->camera (and layer gaps) | 3 mm | 1500 |
+| grid | `N_sim` | `auto` -> 2048 (4.1 mm) | |
+
+**Sim** (`device_profile=sim`, default; 300 nm pixels everywhere, 1 sim px = 1 SLM px = 1 camera px):
+bin 3, gap 0, 3x3 tiles, 3 px detectors touching (pitch 3 px), all gaps 6 um, `N_sim` 256 (set 384 at Nf 1024),
+K = 2 layers. Key = layer size = `ceil(sqrt(N/K))` with `N = ceil(r*2*N_alpha*Nf)`, r = 1.25 (paper guideline).
+
+**Other defaults:** constant encoding, `decoder_over_encoding=True` (decoder trains on every pixel of its square,
+encoding pixels included), `M` 1, `Nf` 100, `Np` 9, `a` in [-0.5, 0.5], `train_a_samples` 10000 (random pool),
+val/test on 1000-point evenly spaced grids, `max_epoch` 150, Adam lr 1e-2 for keys, layers, decoder and readout with
+cosine annealing to 1e-5, `seed` 59, `mask_init_std` 1, `batch_size` 64 (lab runs use 16), `grad_accum_steps` 1.
+
+Lab paper run:
+```
+python train.py --set device_profile=lab num_layers=0 decoder=true Nf=1024 Np=36 M=3 batch_size=16
+python train.py --set device_profile=lab num_layers=0 decoder=true Nf=1024 encoding_mode=split Np=8 M=8 batch_size=16 grad_accum_steps=2
+python test.py --ckpt logs/<run>/model/best.pth            # outputs in logs/<run>/test/
+```
+
+## Main config keys
+
+| key | meaning |
 |---|---|
-| `a` | scalar input to the target functions, sampled/gridded over `[a_min, a_max]` = `[-0.5, 0.5]` |
-| `Np` | number of input-encoding pixels (paper default 9, a 3x3 patch); must be a perfect square |
-| `Nf` | number of target functions approximated in parallel = number of detectors |
-| `M` | number of learned phase keys (time-multiplexed, our addition, not in the paper) |
-| `K` / `num_layers` | number of learned diffractive surfaces |
-| `T` | total learnable phase-key masks; `T == M` now (see "C is gone" below) |
-| phase key | one learned mask on the plane *before* the encoding plane; there are `M` of them |
-| encoding plane | deterministic plane carrying `phi_in(p;a)`; NOT learned, replaces the old "object" image plane |
-| `f_k(a)` | the k-th true target function, closed-form via `target_functions.TargetFunctionSet` |
-| `f_hat(a)` | the model's optically-simulated, key-averaged, normalized approximation of `f(a)` |
-| "wisdom of the crowd" | averaging M independent (noisy/imperfect) key-conditioned estimates before normalizing, to reduce error |
-| `C` / "countries" | **GONE.** Old classifier concept (independent majority-vote groups); has no meaning for regression. `config.C` was deleted; some code still reads it via `getattr(..., 1)` fallback (harmless, always resolves to 1) |
+| `Np`, `Nf`, `M`, `num_layers` (K) | encoding pixels per frame, functions = detectors (perfect square), frames, layers |
+| `encoding_mode` | `constant`: every frame shows all `Np` harmonics (`N_alpha = Np`); `split`: frame m shows harmonics `m*Np .. (m+1)*Np-1` on the same patch (`N_alpha = Np*M`). Patch = closest-to-square rows x cols |
+| `encoding_tile_pattern` | `full` (3x3 copies, default), `single`, `x`, `plus`, `full5` (5x5), or a 9/25-char 0/1 string |
+| `decoder`, `decoder_size`, `decoder_over_encoding`, `lr_decoder` | E+D decoder: on/off, side in SLM px (None = key size), also train on the encoding pixels, its lr |
+| `phase_key_size`, `phase_key_patch_multiple` | key side in SLM px (lab: 400; sim: = layer size; K = 0 sim: 9 x patch); or set as a multiple of the patch width |
+| `key_to_enc_spacing` | 0 = key phase added exactly to the encoding phase (no propagation) |
+| `grad_accum_steps` | split each batch into k micro-batches with the same gradient (for memory) |
+| `meas_noise_std`, `freeze_slm`, `ckpt_to_load`, `load_weights_only` | training-time noise, frozen keys, warm start |
 
-## Config parameter reference (`code/config.py`)
+### How `--set` works ("derive unless you set it")
 
-Every parameter is tagged inline in the file itself:
-- `# PAPER: <value/section>` -- taken directly from the paper
-- `# NOTE: not specified in paper` -- our own choice, paper doesn't fix this
-- `# OBSOLETE` -- classification-era, left in place, safe to delete, not currently read (or only read via a harmless fallback)
+`python train.py --set KEY=VALUE ...` overrides any `config.py` value (type preserved). `recompute_derived()` then
+re-derives the profile values and the design values (`N_trainable_features`, `layer_size`, `phase_key_size`) unless
+you set them yourself, and always recomputes pure geometry (bins, sim-pixel sizes, `N_alpha`, `run_name`, paths).
+Design values are printed at train start and written to `LOG.txt`, tagged `[set]` or `[derived]`, with warnings
+when a plane plus its light spread exceeds `N_sim`, the tiles exceed the key / layer, or a gap exceeds the ASM
+aliasing limit. `test.py` rebuilds checkpoints exactly as trained: `apply_saved_config()` marks every saved key
+explicit; keys added later load with their old behaviour (no `encoding_tile_pattern` -> `single`, no
+`decoder_over_encoding` -> False).
 
-Current defaults (paper-scale regime, adopted 2026-09-17):
+## Files (`code/`)
 
-| category | key params | default | source |
-|---|---|---|---|
-| optics | `wavelength` | 550 nm | PAPER Sec. 2.2 |
-| optics | `device_profile` | `'sim'` | `'sim'` or `'lab'`, see "Device profiles" below; fills the pitch, distance, detector and `N_sim` defaults (2026-10-13, replaced `pixel_pitch`) |
-| optics | `slm_dx` | 300 nm (`sim`) / 8 um (`lab`) | pitch of the phase keys AND the diffractive layers (one pitch since 2026-10-13; `layer_dx` is just a copy) |
-| sim grid | `sim_per_slm` | 1 (`sim`) / 8 (`lab`) | sim px per SLM px; `sim_dx = slm_dx / sim_per_slm`, so every bin is an exact integer. `--set sim_dx=...` instead fixes `sim_per_slm` (must divide exactly) |
-| sim grid | `N_sim` | 256 (`sim`) / `'auto'` (`lab`) | `'auto'`: largest plane (key, layer, encoding extent, detector array) + 2 x light spread over the longest gap, rounded up to 64. Spread angle = min(grid limit, `guard_orders` (2) diffraction orders of one SLM pixel). A WARNING flags gaps beyond the ASM aliasing limit `N_sim * asm_pad_factor * sim_dx^2 / wavelength` |
-| targets | `Np` | 9 (3x3 patch) | PAPER Sec. 2.2, fixed across all their Nf sweeps |
-| targets | `Nf` | 100 | PAPER Fig. 2's smallest tested value (they go up to 1e6) |
-| targets | `a_min`, `a_max` | -0.5, 0.5 | PAPER |
-| targets | `func_seed` | 0 | our reproducibility knob (paper only specifies the sampling distributions, Eq. 10) |
-| phase key | `M` | 1 | our addition, not paper-derived; **the whole point of this project is to sweep this** |
-| encoding | `encoding_tile_pattern` | `'single'` | identical copies of the encoding patch on a 3x3 grid (2026-10-09): `'single'` (centre only), `'x'` (centre + diagonals), `'plus'` (centre + edges), `'full'` (all 9), or a 9-char row-major `0`/`1` string. Since 2026-10-15 also 5x5: `'full5'` (all 25) or a 25-char string. Copies sit one patch + one gap apart (touching at gap 0); the startup design printout gives the extent and warns when it exceeds the key/layer. (Partial-key training, `key_train_region` / `key_mask_encoder_footprint`, was removed the same day.) |
-| encoding | `encoding_mode` | `'constant'` | how the harmonics are spread over the M keys (2026-10-09). `'constant'`: every frame shows all Np harmonics, N_alpha = Np (paper). `'split'`: frame m shows only harmonics m*Np .. (m+1)*Np-1, so N_alpha = Np*M and N = r*2*N_alpha*Nf grows with M; each frame rewrites the same Np-pixel patch with its own block (cross-block terms can only form by interference with unmodulated light, so keep the background transparent). Patch = rows x cols, the closest-to-square factorization (6 -> 2x3, a prime p -> 1xp), row-major. test.py saves `encoding_frames.png` (input plane per key) in split mode. |
-| encoding | `decoder`, `decoder_size`, `lr_decoder` | `False`, `None` (= key size), 1e-2 | E+D architecture (2026-10-15): a learnable phase mask on every encoding-plane SLM pixel that is NOT an encoding pixel (gaps inside each patch, gaps between tile copies, surroundings), `decoder_size` SLM px per side, shared by all M frames. Input-plane phase = encoding phase + decoder phase x mask. Phase stored directly (no sigmoid), initialised to 0, so a freshly added decoder leaves the model unchanged (warm start from a no-decoder checkpoint with `ckpt_to_load=... load_weights_only=true`). Decoder grid is shifted < 1 SLM px so its pixel edges line up with the encoding pixels (one shared SLM grid). Own Adam + cosine schedule (`lr_decoder`); test.py saves `decoder_mask.png`. Off -> bit-identical to before |
-| layers | `num_layers` (K) | 2 | PAPER's default/main design (K=4 is their deeper alt.) |
-| layers | `layer_size` | `ceil(sqrt(N/K))`, `N = N_trainable_features = ceil(r*2*N_alpha*Nf)` (N_alpha = Np, or Np*M in split mode) (34 at Np=9, Nf=100, K=2) | PAPER's guideline `N ~= 1.25*2*Np*Nf` total features. **DERIVED** in `recompute_derived()` from the current Np/Nf/K/M/r unless you `--set layer_size=X` (then X sticks) -- see "How `--set` works" below. `scale_layer_with_M=true` multiplies N by M (constant mode only) |
-| phase key | `phase_key_size` | `= layer_size_sim / phase_key_bin` (one layer wide); or `phase_key_patch_multiple x encoding_x_num_sim / phase_key_bin` if `phase_key_patch_multiple` is set (default `None`) | own choice (2026-09-18): each key matches ONE diffractive layer. Briefly (2026-10-06 only) the default was 2x the encoding patch, from the Nf=100 key-size sweeps (SWEEP_HANDOVER 4y/4z), where layer and 2x patch were nearly the same size; reverted 2026-10-07 because at Nf=1024 (layers 150-290 px) the layer-size key was far better (4aa/4bb). `--set phase_key_patch_multiple=2` restores the 2x-patch rule. **DERIVED** unless set explicitly; checkpoints keep their trained size (saved configs are explicit). The key plane is lit across the whole grid (outside the key the SLM shows phase 0), so the key size sets the TRAINABLE region, not the illuminated one. A train-start WARNING flags when the key or layers plus their lateral light spread exceed N_sim |
-| spacings | `key_to_enc_spacing`, `slm_first_layer_spacing`, `interlayer_spacing`, `last_layer_ccd_spacing` | all 6 um (`sim`) / 2 mm (`lab`) | From the device profile; `--set` any of them to change. In `sim`, since 2026-09-24 a FIXED 6 um instead of the paper's `z = W*sqrt((2*pixel_pitch/wavelength)^2 - 1)` (still in config.py, commented out): the diffraction walk-off is then ~46 px regardless of aperture, so N_sim=256 works for any `layer_size <= 164`. Not derived -- `--set` to change. At `key_to_enc_spacing=0` the key->encoding propagator is skipped and the encoding-plane field is exactly `exp(j*(phi_key + phi_enc))` (`key_to_enc_exact_at_zero`, default True) |
-| detector | `pd_num_rows`, `pd_num_cols` | `sqrt(Nf)` each (10 x 10 at Nf=100) | always `sqrt(Nf)` (not settable since 2026-10-13); Nf must be a perfect square |
-| detector | `camera_dx` | = `sim_dx` (`sim`) / 6 um (`lab`, the Basler's 5.86 um snapped so a camera px is a whole number of sim px) | camera pixel pitch; `camera_dx / sim_dx` must be an integer (`cam_bin`) |
-| detector | `pd_size_cam`, `pd_pitch_cam` | 3, 3 (`sim`) / 4, 4 (`lab`, 24 um touching detectors) | detector width and centre-to-centre pitch in WHOLE camera pixels (2026-10-13). `photodiode_size` / `pd_row/col_spacing` below are now derived from them in metres; `--set`-ting the metre values (as old configs/checkpoints do) overrides them and is rounded to sim px as before |
-| detector | `photodiode_size` | `3 * pixel_pitch` (3 sim px, since 2026-09-28; was 1 px) | detector width; its reading is the MEAN intensity over its `photodiode_pixels x photodiode_pixels` window. 2-3 px detectors largely removed the need for many phase keys at M=1 (SWEEP_HANDOVER 4o/4p) |
-| detector | `pd_row/col_spacing` | `3 * pixel_pitch` (fixed 3 px pitch) | center-to-center pitch, NOT tied to `photodiode_size` (since 2026-09-28): with the 3 px default detectors they touch (fill fraction 1). Always a whole number of sim pixels -- the old `photodiode_size + 0.5*wavelength` (paper) spacing got truncated to 1 px by `int()`, see "Known open items" |
-| sampling | `train_a_samples` | 10000 | fixed pool, resampled/reshuffled each epoch (NOT regenerated -- drawn once, seeded by `config.seed`) |
-| sampling | `val_a_grid_size`, `test_a_grid_size` | 1000, 1000 | dense EVENLY-SPACED grids (not random) -- approximates the paper's continuous RMSE integral (Eq. 16) with low variance and gives gap-free plots |
-| loss | `loss_type` | `'mse'` | only `'mse'` is implemented |
-| loss | `norm_momentum` | 0.1 | **OBSOLETE** -- was the EMA rate for the old running Pmin/Pmax buffers; `loss.py` now uses a learned scale/bias instead (see "Known open items") |
-| training | `batch_size`, `max_epoch`, `lr_slm`, `lr_layer` | 64, 150, 1e-2, 1e-2 | `lr_slm` applies to the phase-key plane (name kept from the old SLM-mask era); also reused as the LR for `loss.py`'s learned scale/bias (`opt_readout` in `train.py`) |
+| file | role |
+|---|---|
+| `config.py` | all parameters, `DEVICE_PROFILES`, `recompute_derived()`, `describe_design()` |
+| `model.py` | `TimeMultiplexedNFA`: keys -> encoding (+ decoder) -> layers -> detector windows; `K = 0` supported |
+| `wave_prop.py` | band-limited angular-spectrum propagator (`FreeSpaceProp`) |
+| `loss.py` | `FunctionApproxLoss`: frame mean, learned scale/bias readout, MSE; `per_function_rmse`, `diffraction_efficiency` (diagnostic) |
+| `target_functions.py` | `TargetFunctionSet`: closed-form targets, shared by train/val/test |
+| `dataloader.py` | random training pool + dense val/test grids |
+| `train.py` | trainer: separate Adam + cosine schedule per group (keys, layers, readout, decoder), eval every 10 epochs and at the last epoch, `best.pth` by val loss, tensorboard |
+| `test.py` | test pass + figures; `--csv/--sweep/--label` append a results row |
+| `plot_sweep.py`, `plot_sweep_grid.py` | older generic sweep plots (current sweeps use per-folder `analyze_*.py` scripts) |
+| `paths.py` | filesystem roots (`SPQPI_*` env overrides); runs go to `code/logs/` (gitignored) |
 
-### Device profiles (2026-10-13)
+`test.py` writes to `<run>/test/`: `test_summary.png` (error histogram, input plane, per-detector RMSE map,
+best/middle/worst fits), `plane_layout.png` (all planes on the sim grid), `phase_keys_final.png`,
+`layer_masks_final.png`, `decoder_mask.png`, `phase_key_similarity.png`, `key_evolution.png` (per-key field at the
+encoding plane and the cumulative fit), `encoding_frames.png` (split mode) and `per_function_rmse.npy`.
 
-`device_profile` switches between the original sub-wavelength simulation and the real
-devices. Every profile value is applied with the "derive unless you set it" rule, so any
-single value can still be `--set`, and a loaded checkpoint keeps exactly what it trained with.
+Tensor shapes: `a [B]` -> targets `[B, Nf]`; key phases `[M, 1, N_sim, N_sim]`; encoding phase `[B, 1 or M, N_sim, N_sim]`;
+`model(a)` -> `[B, M, rows, cols]`; loss -> `f_hat [B, Nf]`.
 
-| | `sim` (default) | `lab` |
-|---|---|---|
-| `slm_dx` (keys + layers) | 300 nm | 8 um |
-| `sim_per_slm` -> `sim_dx` | 1 -> 300 nm | 8 -> 1 um |
-| `camera_dx` | = `sim_dx` | 6 um (Basler 5.86 um, snapped) |
-| `pd_size_cam`, `pd_pitch_cam` | 3, 3 | 4, 4 (24 um, touching) |
-| four spacings | 6 um | 2 mm |
-| `N_sim` | 256 | `'auto'` |
+## Practical notes
 
-`encoding_patch_scale` is the number of SLM pixels per encoding pixel in both profiles (bin 3
--> 24 um in `lab`). `sim` reproduces every earlier run and checkpoint bit-for-bit.
-
-```
-python train.py --set device_profile=lab Np=36 M=3 encoding_patch_scale=3 encoding_tile_pattern=full
-python train.py --set device_profile=lab sim_per_slm=4            # sim_dx 2 um convergence check
-python train.py --set device_profile=lab last_layer_ccd_spacing=1e-3 N_sim=1536
-```
-
-Lab-profile cost (RTX 4090, one train step, 2026-10-13):
-
-| Config | N_sim | Peak memory | Time per step |
-|---|---|---|---|
-| K2 Np36 M3 B64 | 1152 | 14 GB | 0.30 s |
-| K2 Np64 M3 B32 | 1280 | 9 GB | 0.19 s |
-| K0 Np64 M3 B32 | 2304 | 18 GB | 0.32 s |
-
-### How `--set` works ("derive unless you set it", since 2026-09-28)
-
-`python train.py --set KEY=VALUE ...` overrides any config.py value (type preserved).
-Then `recompute_derived()` recomputes everything that depends on other values:
-
-- **Design values** -- `N_trainable_features`, `layer_size`, `phase_key_size`
-  -- are re-derived from their formulas (table above)
-  every time, **unless you `--set` them yourself**, in which case your value sticks.
-  So `--set Np=25` alone gives 56 px layers and keys; `--set Nf=1024 num_layers=3`
-  gives 88 px layers and a 32 x 32 detector grid; `--set layer_size=60` also moves the
-  keys to 60 (they follow `layer_size`).
-- **Pure geometry** -- bin factors, `*_sim` sizes, `*_px` spacings, `encoding_side`,
-  `N_alpha`, `T`, `run_name`/log paths -- is always recomputed.
-- **Everything else** (spacings, detector size/pitch, lr, epochs, ...) is just the
-  config.py value or your `--set` value; nothing derives it.
-
-Which keys you set is tracked in `tc._explicit` (`train.py`'s `_apply_overrides` calls
-`mark_explicit`); it is never written to `config.json`. At train start the design
-values are printed and written to `LOG.txt`, tagged `[set]` or `[derived]`, e.g.
-`layer_size = 56 [derived]  (formula: ceil(sqrt(N/K)), K=2)`.
-
-**Loading a checkpoint** (`test.py`) uses `apply_saved_config()`, which marks EVERY
-saved key explicit -- the model is rebuilt exactly as trained, even if a formula
-or default has changed since (verified on old checkpoints, incl. the 125 px
-`scale_layer_with_M` runs). Scripts that load a checkpoint config themselves should
-use `apply_saved_config(cfg, ckpt["config"]); recompute_derived(cfg)`, NOT
-`cfg.__dict__.update(...)`, which would let design values be re-derived.
-
-Removed 2026-10-13 (no longer accepted): the pre-2026-09-28 key names (`slm_x_num` etc.,
-`LEGACY_ALIASES`) and `LEGACY_DEFAULTS`, `split_patch` (split mode is always the Np-pixel
-frame patch), `phase_key_bin_scale` (no key binning), setting one detector-grid side
-(`pd_num_rows`/`pd_num_cols`), and the frames-per-key factor `C` (T = M). Checkpoints that
-used any of these can no longer be reproduced exactly.
-
-## File-by-file reference
-
-### `config.py`
-Single source of truth for every parameter (see table above) plus `run_name`/
-log-path construction. `init_params()` builds defaults and ends by calling
-`recompute_derived(tc)`, which derives every dependent value (design values only
-if not set explicitly -- see "How `--set` works" above). `mark_explicit`,
-`apply_saved_config` and `describe_design` support that; `config_to_dict(tc)`
-flattens to a JSON-serializable dict for checkpoints/`config.json`.
-
-### `target_functions.py`
-`TargetFunctionSet(config)`: generates `Nf` fixed random Fourier-coefficient sets
-(seeded by `config.func_seed`, PAPER Eq. 10) and evaluates `f_k(a)` in closed form
-(no optical simulation) for any batch of `a`. Calibrates its own global min/max
-(over a dense 2001-point grid) at construction time so `__call__(a)` always
-returns values in `[0,1]`. This is the ONLY source of ground truth; it's shared
-(same object) across train/val/test splits so they all see the same `Nf`
-functions.
-
-### `dataloader.py`
-`FunctionApproxDataset(a_values, target_fn)`: thin wrapper, precomputes targets
-once at construction. `get_function_approx_dataloaders(config)` returns
-`(train_loader, val_loader, test_loader, target_fn)` -- train is a fixed random
-pool (`train_a_samples`, seeded by `config.seed`, reshuffled every epoch by
-`shuffle=True`); val/test are dense `torch.linspace` grids (`shuffle=False`,
-`drop_last=False` so the full grid is always covered, no gaps).
-Old image-dataset classes (MNIST/FashionMNIST/CIFAR10/TinyImageNet/grating) have
-been deleted from this file; a few now-unused imports (`os`, `random`, `Path`,
-`F`, `np`, `torchvision`, `transforms`) are leftover clutter, harmless.
-
-### `model.py`
-`TimeMultiplexedNFA(config)` (renamed from `TimeMultiplexedClassifier`):
-implements exactly the physical path in the diagram above. Key methods:
-- `_encode_input(a)`: builds `phi_in(p;a)` for a batch `a : [B]`, returns
-  `[B, 1, N_sim, N_sim]` (deterministic, no learnable parameters, zero outside the
-  Np-pixel patch)
-- `_get_slm_field()`: the learned phase-key field (still named "slm" internally --
-  same physical SLM hardware, new logical role; NOT renamed to avoid unnecessary
-  attribute churn)
-- `_get_layer_phase(k)`: the k-th learned diffractive layer's field
-- `forward(a, return_field=False) -> I_vec [B, T, pd_num_rows, pd_num_cols]` (or
-  `(I_vec, I_ccd)` if `return_field=True`): the ONLY forward path now -- there is
-  no more "no diffractive layers" bypass (`num_layers > 0` is asserted in
-  `__init__`; `measure()` and `diffraction_efficiency()` were deleted along with
-  it, since both existed solely to support that bypass and neither is called
-  anywhere else)
-
-**model.py returns the RAWEST per-detector intensity. No averaging over M, no
-normalization, no target comparison happens here -- that's all loss.py's job**
-(explicit design decision).
-
-### `loss.py`
-`FunctionApproxLoss(config)`, an `nn.Module` with two of its own learnable
-parameters (`_raw_scale`, `bias` -- a global affine readout, see "Known open
-items" below for why). Old `ClassificationLoss` has been deleted (was already
-broken -- referenced config attributes the user had removed).
-- `forward(I_vec, target) -> (loss, f_hat)`: averages `I_vec` over the T/M axis
-  (`I_vec.mean(dim=1)`, chosen over `sum` so the intensity scale stays
-  M-invariant -- important since M is the primary thing this project sweeps),
-  reshapes `[B, rows, cols] -> [B, Nf]` (row-major, `k = r*cols + c`), applies
-  `f_hat = I_summed * scale + bias` (learned, `scale = softplus(_raw_scale)` to
-  stay positive), then MSE against `target`
-- `per_function_rmse(f_hat, target)` (`@staticmethod`): `[N, Nf] -> [Nf]`, the
-  diagnostic/plotting metric (paper's Eq. 16-style), NOT the training loss
-- `scale`/`bias` are trained by their own optimizer (`train.py`'s
-  `opt_readout`/`sched_readout`, reusing `lr_slm`'s LR) and round-trip through
-  checkpoints via `criterion.state_dict()`
-
-### `train.py`
-`TimeMultiplexedNFATrainer`, rewritten in place (old classification version not
-kept side-by-side -- a single-entry-point script can't sensibly host two parallel
-`main()`s). **wandb support removed entirely per explicit request -- tensorboard
-only.** Key pieces:
-- `_set_mode(training)`: toggles `.train()`/`.eval()` on `model` and `criterion`
-  together (kept as good habit -- no longer functionally required now that
-  `criterion` has no training-mode-dependent state, see loss.py note above)
-- `_init_optimizers()`: THREE optimizer/scheduler pairs now --
-  `opt_slm`/`sched_slm` (phase-key plane), `opt_layers`/`sched_layers`
-  (diffractive layers, always present), `opt_readout`/`sched_readout`
-  (loss.py's scale/bias, reuses `lr_slm`'s LR) -- `self.criterion` is
-  constructed BEFORE `_init_optimizers()` is called (order matters:
-  `opt_readout` needs `self.criterion.parameters()` to already exist)
-- `train_step(a, target)`: one optimizer step across all three groups, returns
-  `(loss, key_gnorm, layer_gnorm)`
-- `evaluate(loader, tag='val', plot=True, n_show=4)`: single pass over a whole
-  loader (typically a dense grid) in eval mode; returns `(loss,
-  per_function_rmse)` and optionally saves a target-vs-approximation plot for 4
-  representative functions (best-fit / worst-fit / two mid-error, paper Fig.
-  2b/2c-style) -- this replaced the old per-batch `valid_step` AND the old
-  classification `save_images` diagnostic (deleted, not applicable to regression)
-- checkpoints (`_checkpoint_dict`/`save`/`save_best`/`load`) also save/restore
-  `criterion.state_dict()` (the learned scale/bias) and `opt_readout`/
-  `sched_readout` so a resumed run doesn't lose its calibration; tracks
-  `best_val_loss` (lower is better), not `best_val_acc`
-- `save_phase_keys()` (renamed from `save_slm_masks`): one row of M keys, no more
-  country/member grid
-- `save_layer_masks()`: unchanged in spirit, docstring updated
-
-Usage: `python train.py --set Np=25 M=3` etc. (`--set KEY=VALUE`, any type,
-preserved; dependent sizes follow automatically -- see "How `--set` works").
-
-### `test.py`
-Standalone eval script, also rewritten in place. `evaluate(ckpt_path, out_dir,
-csv_path, sweep_name, run_label)`:
-- `_eval_loop`: single pass over the (dense) test loader, returns `agg` dict with
-  `a`/`f_hat`/`target` sorted ascending by `a`, plus per-batch `loss` list
-- `_print_summary` / `_write_csv`: loss + per-function RMSE (mean/max/min) instead
-  of accuracy/confusion-matrix/per-class-F1
-- `_save_error_distribution`: histogram of per-function RMSE (paper Fig. 2a-style)
-- `_save_function_curves`: target-vs-approx curves, same best/worst/mid-error
-  selection as `train.py`'s `evaluate()`
-- `_save_error_heatmap` (added 2026-09-18): spatial map of per-function RMSE laid
-  out on the physical detector plane -- reshapes the `[Nf]` RMSE vector back into
-  the `pd_num_rows x pd_num_cols` grid (`k = r*cols + c`, same indexing as
-  `model.py`), positions it using the true `pd_row_spacing`/`pd_col_spacing`, and
-  lets `imshow(..., interpolation='bilinear')` smooth between the discrete
-  detectors purely for legibility (real detector centers are overlaid as dots so
-  the interpolated fill is never mistaken for an actual measurement). Deliberately
-  dependency-light: matplotlib's own `'hot'` colormap and bilinear resampling, no
-  `scipy`/custom colormap.
-- `_save_mask_similarity`: pairwise CIRCULAR phase similarity between the M keys
-  (`|mean(exp(i*(phi_i - phi_j)))|`, invariant to a constant phase offset since
-  that cancels under `|field|^2`) -- **low off-diagonal similarity means the keys
-  are learning genuinely different things (good -- the ensembling is doing
-  something); high similarity means the keys are redundant (the M-averaging isn't
-  buying anything).** This is the most direct diagnostic for whether the whole
-  phase-key idea is working.
-- Dropped entirely: dataset selection (`_build_test_loader`, `--dataset` flag --
-  there's no image dataset anymore, the test set is fully determined by config's
-  `Np`/`Nf`/`func_seed`/`test_a_grid_size`), the legacy checkpoint-shape-repair
-  logic (T inferred from `slm_phases.shape[0]` -- was a safety net for older
-  classifier checkpoints, doesn't apply to the new format), the hardcoded stale
-  classifier checkpoint path in `__main__` (now `None`, requires `--ckpt`)
-
-Usage: `python test.py --ckpt logs/<run>/model/best.pth` (outputs default to
-`logs/<run>/test/`; add `--csv path.csv --sweep NAME --label NAME` to append a
-summary row for sweeps across multiple runs).
-
-### `wave_prop.py`
-`FreeSpaceProp(config, z=None)`: band-limited angular-spectrum free-space
-propagator, unchanged by the NFA pivot (already fully general over
-`N_sim`/`sim_dx`/`z`). `z=None` falls back to `config.z_slm_ccd`, which is now
-OBSOLETE (nothing in the current codebase calls `FreeSpaceProp` without an
-explicit `z`) -- harmless dead branch.
-
-### `paths.py`
-Unchanged. Resolves `REPO_ROOT`/`DATA_ROOT`/`CKPT_ROOT`/`LOG_DIR`, overridable via
-`SPQPI_*` env vars. `LOG_DIR = code/logs/` (gitignored). No datasets are needed
-anymore (no image dataset), so `DATA_ROOT` is effectively unused by this pivot,
-but left as-is since other sibling projects may share it.
-
-## Tensor shape cheat-sheet
-
-```
-a (dataloader)                     [B]
-target (dataloader, TargetFunctionSet)   [B, Nf]           in [0,1]
-model._encode_input(a)             [B, 1, N_sim, N_sim]    real phase (radians)
-model._get_slm_field()             [T, 1, N_sim, N_sim]    real phase (radians)
-model.forward(a) -> I_vec          [B, T, pd_num_rows, pd_num_cols]   raw intensity
-loss._detector_to_function(I_vec)  [B, Nf]                  averaged over T, reshaped
-loss.normalize(...)  -> f_hat      [B, Nf]                  ~[0,1], learned affine, NOT hard-clamped
-loss.forward(...) -> (loss, f_hat) scalar, [B, Nf]
-per_function_rmse(f_hat, target)   [Nf]
-```
-
-## Known open items (as of this README)
-
-- ~~Training instability~~ **RESOLVED (2026-09-17).** A 60-epoch smoke run (M=5)
-  had val loss improve then get noticeably worse. A 5-point LR sweep at M=1
-  (`logs/lr_sweep_M1/`, 1e-2 down to 1e-4) showed the SAME qualitative failure
-  at every LR (violent spikes at high LR -- val loss hit 146 at one point,
-  impossible for a bounded-[0,1] MSE -- down to a slower but still-present
-  late-training climb at 1e-4), which ruled out "LR too high" as the sole
-  cause. Loading the saved checkpoints and inspecting the old
-  `criterion.running_min`/`running_max` directly showed why: raw detector
-  power collapsed by 3-6 orders of magnitude over training and swung by up to
-  ~1000x between checkpoints just a few epochs apart (nothing in the loss
-  constrained overall optical power), and the EMA-based running Pmin/Pmax
-  normalizer (fixed momentum, out-of-loop) couldn't track those sudden swings,
-  so its denominator was sometimes badly mismatched with the current scale --
-  producing exactly this kind of blow-up.
-
-  **Fix:** `loss.py`'s running Pmin/Pmax buffers were replaced with a LEARNED
-  affine readout (`scale`/`bias`, trained by backprop via `train.py`'s new
-  `opt_readout`, see loss.py's module docstring for the full writeup). A
-  second, otherwise-identical LR sweep (`logs/lr_sweep_M1_learnedscale/`)
-  confirmed the fix: every one of the 5 LRs now converges smoothly and
-  monotonically over all 150 epochs -- zero spikes, train/val loss track each
-  other closely throughout, and results now order sanely by LR (higher LR
-  reaches a better minimum within the fixed epoch budget: lr=1e-2 final loss
-  0.00206 vs the old EMA version's best-epoch loss of 0.0188, roughly a 9x
-  improvement, with lr=1e-4 at the other end at 0.0173). Side-by-side plot:
-  `logs/lr_sweep_before_after.png`.
-
-  **Gotcha for future readers:** both of these LR sweeps (`logs/lr_sweep_M1/`
-  and `logs/lr_sweep_M1_learnedscale/`) were actually run with
-  `train_a_samples=512`, `batch_size=16` (32 batches/epoch) -- NOT the
-  config.py defaults (20000 / 12). This wasn't a deliberate choice, it just
-  wasn't noticed until the much-larger-scale sweep below made the mismatch
-  obvious. Don't treat those two sweeps' absolute loss/RMSE numbers as
-  representative of the real default sample budget -- check each run's own
-  `config.json` before comparing across sweeps in this repo.
-- **`train_a_samples` sweep (2026-09-18, M=1, lr=1e-2, `batch_size=64`, 150
-  epochs, `logs/trainA_sweep_M1/`)**: 20000/30000/40000/50000 samples/epoch
-  gave rmse_mean 0.00454 / 0.00328 / 0.00337 / 0.00282 respectively (plot:
-  `logs/trainA_sweep_M1/trainA_sweep_rmse.png`). Two takeaways: (1) the big
-  win is going from a badly-undersampled regime (the 512-sample LR sweeps
-  above, rmse_mean 0.044) up to ~20k -- roughly 10x -- but (2) *within*
-  20k-50k, further increases give small, noisy returns (max RMSE isn't even
-  monotonic). `train_a_samples` looks like a mostly-exhausted lever now; best
-  result so far (50k) is still ~4 orders of magnitude off the paper's
-  reported ~1e-7 RMSE for Nf=100. See `code/logs/SWEEP_HANDOVER.txt` for the
-  fuller experiment log and suggested next directions (deviating from the
-  paper's spacing defaults, then sweeping `M`).
-- ~~Detector crosstalk~~ **FOUND & FIXED (2026-09-18) -- the single biggest
-  result of this project so far.** The paper's own inter-detector gap
-  (`photodiode_size + 0.5*wavelength` = 1.9 sim-grid pixels) gets truncated by
-  `int(pd_row_spacing / sim_dx)` down to 1 pixel -- exactly `photodiode_pixels`
-  itself -- meaning every experiment up to this point (both LR sweeps, the
-  `train_a_samples` sweep, the `key_to_enc_spacing` sweep) had detectors
-  simulated as touching, with ZERO real gap, silently defeating the paper's
-  own crosstalk-suppression design and putting a hard accuracy CEILING on
-  everything measured against that geometry.
-
-  **Fix:** `pd_row/col_spacing` changed to a whole multiple of
-  `photodiode_size` (guarantees an integer-pixel gap regardless of `sim_dx`,
-  see config.py's table row above) -- current default is `4*photodiode_size`
-  (3 pixels of real gap). A dedicated sweep (M=1, 20k samples,
-  `logs/pdspacing_sweep_M1/`, plot `pdspacing_sweep_M1_rmse.png`) scanning
-  2/3/4/5 pixels of center-to-center spacing found a hard cliff: 2px (1 pixel
-  gap) gives rmse_mean=0.0064 (in line with every prior "normal" result in
-  this file), but 3px (2 pixel gap) collapses to rmse_mean=1e-6, 4px to
-  effectively 0/1e-6 -- matching the PAPER'S OWN reported ~1e-7 precision, at
-  plain M=1 with nothing else changed. Verified genuine (not a degenerate
-  collapse) by inspecting the actual target-vs-approx curves -- distinct,
-  complex, wiggly target functions fit essentially exactly -- and the
-  training log, which shows ordinary smooth SGD convergence over 150 epochs,
-  not a discontinuous jump.
-
-  **Why this matters for everything above:** every sweep result recorded
-  earlier in this section (train_a_samples, key_to_enc_spacing, both LR
-  sweeps) was measured against a crosstalk-limited accuracy ceiling, not
-  against those parameters' own true effect -- e.g. `train_a_samples`'s
-  "mostly exhausted, ~4 orders of magnitude off the paper" conclusion no
-  longer holds once crosstalk is fixed; that gap was crosstalk, not sample
-  count. Those sweeps are worth re-running at a crosstalk-free spacing before
-  trusting their conclusions.
-
-  **Implication for the M-sweep (this project's actual point):** at a
-  crosstalk-free spacing, M=1 alone may already be near the achievable floor,
-  leaving little residual error for the M-key "wisdom of the crowd" averaging
-  to visibly reduce -- see `code/logs/SWEEP_HANDOVER.txt` and the in-progress
-  `logs/M_sweep_pd2px/` (Np=9) and `logs/M_sweep_pd2px_Np25/` (Np=25) sweeps,
-  both run at a smaller, non-machine-precision 2px spacing specifically so
-  there's real residual error left to observe an M effect on.
-- **GPU utilization / `batch_size`**: the config default `batch_size=12` only
-  reaches ~36-39% utilization on an RTX 4090 for this model size (kernel-launch
-  overhead dominates at such a small batch) -- `batch_size=64` was found to
-  give roughly 4.5x the throughput (~5700 vs ~1250 samples/s) and is now the
-  batch size used for sweeps in this repo, though `config.py`'s own default is
-  left at 12 (not changed without being asked). Worth re-benchmarking batch
-  size again if the model's shape (`Np`/`Nf`/`layer_size`/`M`) changes a lot.
-- **RESOLVED 2026-09-28 -- `layer_size`/`phase_key_size` used to be computed only
-  once at `init_params()`** (from the default Np=9/Nf=100/K=2), so `--set Np=25`
-  alone silently trained 34 px layers, and every sweep had to pass `layer_size`,
-  `phase_key_size`, `pd_num_rows/cols` explicitly. They are now derived after
-  overrides unless set -- see "How `--set` works". The same change fixed
-  `python train.py` with NO `--set` crashing (`N_alpha`/`T` were only set by
-  `recompute_derived()`, which then only ran when overrides were given).
-- **Diffraction-efficiency loss penalty (paper Eq. 13/14, `LDE`) was
-  deliberately NOT implemented** -- explicit decision to keep the first version
-  to plain MSE only; revisit once the core M-key accuracy idea is validated.
-- **`M` default is 1** (no ensembling). First M sweeps (2026-09-18, M in
-  {1,2,3,5,8}, `pd_row/col_spacing=2*photodiode_size` so there's real
-  residual error at M=1 to average down -- a fully crosstalk-free spacing
-  gets too close to machine precision at M=1 already, see the crosstalk
-  bullet above) found a striking, Np-dependent split: at Np=9
-  (`logs/M_sweep_pd2px/`) M gave a >3000x rmse_mean reduction (0.0064 ->
-  2.3e-6); at Np=25 (`logs/M_sweep_pd2px_Np25/`, needed `layer_size`/
-  `phase_key_size`=56 and the four spacings recomputed, see below) M gave <2x
-  (0.0097 -> 0.0053). Comparison plot: `logs/M_sweep_Np9_vs_Np25_rmse.png`.
-  Leading hypothesis: Np=25 may be capacity-limited (layer_size only grew
-  34->56 while Np grew 9->25) rather than crosstalk/redundancy-limited --
-  M-averaging cancels independent per-key noise, not a systematic capacity
-  shortfall shared by every key through the same diffractive layers. Not
-  yet confirmed -- see `code/logs/SWEEP_HANDOVER.txt` for the suggested
-  next experiment (more capacity at Np=25, check if the M-effect returns).
-  `phase_key_similarity.png` (test.py) -- whether increasing M is actually
-  buying diversity or just redundant keys -- hasn't been systematically
-  checked across these sweeps yet either.
-- **`key_to_enc_spacing` sweep (2026-09-18, complete, M=1, 20k samples,
-  `logs/keyspacing_sweep_M1/`)**: deliberately deviating from the paper's
-  uniform-spacing choice for just this one gap (phase-key -> encoding plane,
-  which has no paper analogue anyway), scaling the paper-derived default
-  (~4.71 um) by 0.5x/1x/2x/3x/5x. Result: a clear non-monotonic dip at 2x
-  (rmse_mean 0.00338, rmse_max 0.01089 -- best of the 5) with both smaller
-  (0.5x/1x) and larger (3x/5x) spacings worse on both metrics -- looks like
-  a real interior optimum, not a "more/less is always better" trend. Plot:
-  `logs/keyspacing_sweep_M1/keyspacing_sweep_rmse.png`. See
-  `code/logs/SWEEP_HANDOVER.txt` for the full numbers and the suggested
-  narrower follow-up sweep (around 1.5x-2.5x).
-- Config still carries a few small OBSOLETE-tagged leftovers, intentionally not
-  deleted (tracked so you can remove them yourself): `config.z_slm_ccd`,
-  `config.norm_momentum` (see the loss.py rewrite above), and a stale comment
-  in `recompute_derived()` about `config.C` (the attribute itself is already
-  gone; `model.py`'s `getattr(config, 'C', 1)` fallback makes this harmless).
-- `dataloader.py` still imports `os`/`random`/`Path`/`F`/`np`/`torchvision`/
-  `transforms`, all now unused (leftover from the deleted image-dataset code).
+- **Memory:** at Nf 1024 in the lab profile (`N_sim` 2048, batch 16), constant M5 needs 13.5 GB and constant M8
+  20.3 GB; split needs more per frame (M4 15.2 GB). Keep the peak <= ~21 GB on a 24 GB card that drives a display, and
+  use `grad_accum_steps` rather than a smaller batch. Wall time grows ~linearly with M (lab constant M5 ~5.7 h).
+- **Intermittent segfaults:** `train.py` / `test.py` occasionally segfault at startup or teardown on this Windows
+  machine. A rerun succeeds; sweep scripts retry (see the handover lessons).
+- **Comparability:** compare runs only at the same batch size and epoch count (batch alone shifts ~3x at the 1e-7
+  level; `max_epoch` stretches the cosine schedule).
+- **Not implemented:** the paper's diffraction-efficiency loss term (Eq. 13/14); only MSE.
 
 ## Provenance
 
-The original nine files in `code/` were copied from
-[`ary-portes/single-pixel-qpi-paper`](https://github.com/ary-portes/single-pixel-qpi-paper)
-(commit `f5b388c1d8191181444970c7c397b7249aa60fd9`, 29 Aug 2026), then pivoted to
-image classification (Sep 2026), then pivoted again to this parallel nonlinear
-function approximation design (17 Sep 2026) -- `config.py`, `model.py`,
-`loss.py`, `dataloader.py`, `train.py`, `test.py` rewritten, `target_functions.py`
-newly added, `wave_prop.py`/`paths.py` unchanged throughout both pivots.
+The original files came from [`ary-portes/single-pixel-qpi-paper`](https://github.com/ary-portes/single-pixel-qpi-paper)
+(commit `f5b388c`, 29 Aug 2026), were pivoted to time-multiplexed image classification (Sep 2026) and then to this
+function-approximation design (17 Sep 2026). Lab profile and E+D added 13-16 Oct 2026; defaults locked 17-18 Oct 2026.

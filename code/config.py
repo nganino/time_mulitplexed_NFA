@@ -58,6 +58,8 @@ def apply_saved_config(tc, saved):
     if 'encoding_tile_pattern' not in saved:     # saved before tiles existed (2026-10-09): one patch
         tc.encoding_tile_pattern = 'single'
         mark_explicit(tc, ['encoding_tile_pattern'])
+    if 'decoder_over_encoding' not in saved:     # saved before the flag existed (2026-10-17): decoder off the encoding pixels
+        tc.decoder_over_encoding = False
 
 
 def _derive(tc, key, value):
@@ -358,7 +360,7 @@ def init_params():
     # ------------------------------------------------------------------ #
     tc.decoder      = False   # True: train a phase mask on every non-encoding SLM pixel of the encoding plane
     tc.decoder_size = None    # SLM px per side; None -> phase_key_size
-    tc.decoder_over_encoding = False  # True: decoder also trains on the encoding pixels (every pixel of its square; superset of False)
+    tc.decoder_over_encoding = True   # True (default since 2026-10-18): decoder also trains on the encoding pixels (every pixel of its square; superset of False)
 
     tc.mask_init_method = 'normal'
     tc.mask_init_std   = 1
@@ -394,6 +396,7 @@ def init_params():
     #  Training hyper-parameters                                         #
     # ------------------------------------------------------------------ #
     tc.batch_size       = 64
+    tc.grad_accum_steps = 1    # split each batch into this many micro-batches (same gradient, less memory)
     tc.test_batch_size  = 4
     tc.max_epoch        = 150
     tc.seed             = 59
