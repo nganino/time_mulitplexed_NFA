@@ -1,25 +1,10 @@
 '''
-Time-Multiplexed NFA — dataloader (Nonlinear Function Approximation)
-
-The old classification-era image-dataset loading machinery (MNIST/
-FashionMNIST/CIFAR10/TinyImageNet/grating -> phase objects) has been deleted
-from this file. train.py/test.py now import get_function_approx_dataloaders()
-below; there is no image dataset anymore -- see target_functions.py and the
-"NONLINEAR FUNCTION APPROXIMATION" section below for what replaced it.
-
-NOTE: os/random/Path/F/np/torchvision/transforms are unused leftover imports
-from that deleted code -- harmless, not cleaned up yet.
+Time-Multiplexed NFA — dataloader (Nonlinear Function Approximation): train / val / test sets of the scalar input a
+with their Nf closed-form targets (target_functions.TargetFunctionSet). Used by train.py and test.py.
 '''
 
-import os
-import random
-from pathlib import Path
 import torch
 import torch.utils.data as data
-import torch.nn.functional as F
-import numpy as np
-import torchvision
-import torchvision.transforms as transforms
 
 # =========================================================================== #
 #  NONLINEAR FUNCTION APPROXIMATION (NFA) -- dataloader                       #
@@ -36,6 +21,10 @@ import torchvision.transforms as transforms
 #  (config.val_a_grid_size / config.test_a_grid_size points), so the          #
 #  reported per-function error approximates the paper's continuous RMSE      #
 #  integral (Eq. 16) with low variance -- see design discussion.              #
+#  Val is linspace(a_min, a_max, N) (endpoints included); test (since        #
+#  2026-10-27) is the N - 1 midpoints of linspace(a_min, a_max, N_test), so  #
+#  best.pth (picked on val) is tested on points it was not selected on.      #
+#  With equal sizes (default) every test point sits halfway between two val. #
 # =========================================================================== #
 
 from target_functions import TargetFunctionSet
@@ -83,7 +72,10 @@ def get_function_approx_dataloaders(config):
     gen = torch.Generator().manual_seed(int(config.seed))
     train_a = torch.rand(config.train_a_samples, generator=gen) * (config.a_max - config.a_min) + config.a_min
     val_a   = torch.linspace(config.a_min, config.a_max, config.val_a_grid_size)
-    test_a  = torch.linspace(config.a_min, config.a_max, config.test_a_grid_size)
+    # test: midpoints of linspace(a_min, a_max, test_a_grid_size) (N - 1 points), held out from val -- with equal sizes
+    # exactly halfway between val points (before 2026-10-27 test used the val grid itself)
+    grid    = torch.linspace(config.a_min, config.a_max, config.test_a_grid_size, dtype=torch.float64)
+    test_a  = 0.5 * (grid[1:] + grid[:-1])
 
     train_ds = FunctionApproxDataset(train_a, target_fn)
     val_ds   = FunctionApproxDataset(val_a, target_fn)

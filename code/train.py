@@ -6,8 +6,8 @@ Usage:
     python train.py --set freeze_slm=true
     python train.py --set M=5 lr_slm=5e-3
     python train.py --set Np=25 Nf=1024 num_layers=3 M=2   # sizes follow automatically
-    python train.py --set device_profile=lab                # 8 um SLM, 6 um camera, 1 um sim px
-    python train.py --set device_profile=lab sim_per_slm=4 last_layer_ccd_spacing=1e-3
+    python train.py --set device_profile=lab num_layers=0 decoder=true Nf=1024 Np=64 M=2 batch_size=16
+    python train.py --set device_profile=lab ... slm_phase_bits=8   # 8-bit SLM phase
     python train.py --set encoding_mode=split Np=9 M=4      # 36 harmonics, 9 per frame
 
 --set KEY=VALUE overrides any config.py value. Design values (layer_size,
@@ -17,17 +17,12 @@ which case your value sticks. The derived values are printed (and written to
 LOG.txt) at startup, tagged [set] or [derived]. See config.py "Derive unless you
 set it" and README.md.
 
-Logs are written to /logs/.
-Shared modules (dataloader, loss, wave_prop) are imported from the parent project.
+Runs are written to code/logs/<run_name>/ (or --log_dir): config.json, LOG.txt, model/ (best.pth + the last
+epoch=*.pth checkpoints), tfboard/. Figures come from test.py.
 
-NOTE: this file was rewritten in place for the NFA pivot (image classification
--> parallel nonlinear function approximation) rather than left side-by-side
-with the old classification version, since a single-entry-point training
-script can't sensibly host two parallel `main()`s / Trainer classes. Notable
-removals rather than renames: `save_images` (classification-only diagnostic
-figure -- superseded by `evaluate()`'s target-vs-approximation plot),
-per-batch `valid_step` (folded into the single-pass `evaluate()`), and wandb
-support (dropped per request -- tensorboard only from now on).
+Optimised: phase keys, diffractive layers and (E+D) decoder phases, each with its own Adam + cosine schedule, plus the
+training-only readout scale / offset (train_readout affine, the default; discarded after training). Every val / test
+number uses the min-max readout (loss.py). Checkpoints written before 2026-10-23 are rejected on load.
 '''
 
 import sys, os
@@ -41,12 +36,9 @@ import numpy as np
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
 import torch
-import matplotlib
-matplotlib.use('Agg')
-from matplotlib import pyplot as plt
 
 from config import (init_params, recompute_derived, config_to_dict,
-                    mark_explicit, describe_design)
+                    mark_explicit, describe_design, CHECKPOINT_READOUT, check_checkpoint_format)
 from model import TimeMultiplexedNFA
 from dataloader import get_function_approx_dataloaders
 from loss import FunctionApproxLoss
@@ -69,6 +61,8 @@ def _apply_overrides(config, overrides):
             val = val_str.lower() in ('true', '1', 'yes')
         elif isinstance(current, int):
             val = int(float(val_str))
+            if val != float(val_str):               # e.g. 0.01 onto an int default would silently become 0
+                raise ValueError(f'--set {key}={val_str}: {key} is an int (default {current!r}), got a fractional value')
         elif isinstance(current, float):
             val = float(val_str)
         elif current is None:
@@ -99,15 +93,21 @@ class TimeMultiplexedNFATrainer:
         self.best_val_loss = float('inf')
 
         self.model     = self._init_model()
-        self.criterion = FunctionApproxLoss(config).to(self.device)
-        (self.opt_slm, self.opt_layers, self.opt_readout,
-         self.sched_slm, self.sched_layers, self.sched_readout) = self._init_optimizers()
+        self.criterion = FunctionApproxLoss(config).to(self.device)   # min-max readout (+ training-only affine)
+        (self.opt_slm, self.opt_layers,
+         self.sched_slm, self.sched_layers) = self._init_optimizers()
+        # Training-only learned readout (train_readout 'affine'): its scale / offset use lr_slm and its cosine schedule
+        self.opt_readout = self.sched_readout = None
+        if list(self.criterion.parameters()):
+            self.opt_readout = torch.optim.Adam(self.criterion.parameters(), lr=config.lr_slm, betas=(0.9, 0.999))
+            self.sched_readout = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.opt_readout, T_max=config.max_epoch, eta_min=config.lr_slm * config.lr_min_ratio)
         # Decoder (E+D, model.py): own Adam + cosine schedule, only when config.decoder is on
         self.opt_decoder = self.sched_decoder = None
         if self.model.decoder:
             self.opt_decoder = torch.optim.Adam([self.model.decoder_phases], lr=config.lr_decoder, betas=(0.9, 0.999))
             self.sched_decoder = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.opt_decoder, T_max=config.max_epoch, eta_min=1e-5)
+                self.opt_decoder, T_max=config.max_epoch, eta_min=config.lr_decoder * config.lr_min_ratio)
 
         if config.ckpt_to_load is not None:
             print(f'Loading checkpoint: {config.ckpt_to_load}')
@@ -126,8 +126,9 @@ class TimeMultiplexedNFATrainer:
         print(f'  Layers     : {model.num_layers} x {self.config.layer_size}^2'
               f' = {model.num_layers * self.config.layer_size ** 2:,} params')
         if model.decoder:
-            print(f'  Decoder    : {model.decoder_size}^2 SLM px, {int(model.decoder_mask.sum().item()) // model.phase_key_bin ** 2:,}'
-                  f' trainable SLM px')
+            n_px = int(model.decoder_mask_px.sum().item())
+            print(f'  Decoder    : {model.decoder_size}^2 SLM px, {model.n_decoders} x {n_px:,} trainable SLM px'
+                  f' ({"one per key" if model.decoder_per_key else "shared by all keys"})')
         return model
 
     def _init_optimizers(self):
@@ -143,7 +144,7 @@ class TimeMultiplexedNFATrainer:
                 [self.model.slm_phases], lr=self.config.lr_slm, betas=(0.9, 0.999)
             )
             sched_slm = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt_slm, T_max=self.config.max_epoch, eta_min=1e-5
+                opt_slm, T_max=self.config.max_epoch, eta_min=self.config.lr_slm * self.config.lr_min_ratio
             )
 
         # Diffractive layers (an empty parameter at K = 0, so this optimizer is then a no-op).
@@ -151,29 +152,16 @@ class TimeMultiplexedNFATrainer:
             [self.model.layer_phases], lr=self.config.lr_layer, betas=(0.9, 0.999)
         )
         sched_layers = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt_layers, T_max=self.config.max_epoch, eta_min=1e-5
+            opt_layers, T_max=self.config.max_epoch, eta_min=self.config.lr_layer * self.config.lr_min_ratio
         )
 
-        # Learned affine readout (loss.py's scale/bias, replaced the old EMA
-        # running Pmin/Pmax -- see loss.py's module docstring for why). Just
-        # two scalars with a very direct, well-conditioned gradient; reuses
-        # lr_slm's LR since there's no strong reason for a dedicated knob.
-        opt_readout = torch.optim.Adam(
-            self.criterion.parameters(), lr=self.config.lr_slm, betas=(0.9, 0.999)
-        )
-        sched_readout = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt_readout, T_max=self.config.max_epoch, eta_min=1e-5
-        )
-
-        return opt_slm, opt_layers, opt_readout, sched_slm, sched_layers, sched_readout
+        return opt_slm, opt_layers, sched_slm, sched_layers
 
     # ---------------------------------------------------------------------- #
 
     def _set_mode(self, training):
-        '''Toggle train()/eval() on both the model and the loss module. The
-        loss module no longer holds training-mode-dependent state (its old
-        running Pmin/Pmax buffers were replaced by a learned scale/bias, see
-        loss.py) -- this is kept mainly for good habit / future-proofing.'''
+        '''Toggle train()/eval() on both the model and the loss module (the loss module holds no
+        training-mode-dependent state; the model's measurement noise is training-only).'''
         if training:
             self.model.train(); self.criterion.train()
         else:
@@ -187,17 +175,23 @@ class TimeMultiplexedNFATrainer:
         if self.opt_slm is not None:
             self.opt_slm.zero_grad(set_to_none=True)
         self.opt_layers.zero_grad(set_to_none=True)
-        self.opt_readout.zero_grad(set_to_none=True)
         if self.opt_decoder is not None:
             self.opt_decoder.zero_grad(set_to_none=True)
+        if self.opt_readout is not None:
+            self.opt_readout.zero_grad(set_to_none=True)
 
-        # Gradient accumulation: k equal micro-batches, each loss scaled by 1/k, so the summed gradient equals the
-        # full-batch gradient (the loss is a plain mean and nothing depends on the batch) at 1/k of the memory
+        # Gradient accumulation: k equal micro-batches, each loss scaled by 1/k, at 1/k of the memory. Each micro-batch
+        # min-max normalizes with its own Pmin / Pmax, so the summed gradient is close to, not exactly, the full-batch one
         k = int(getattr(self.config, 'grad_accum_steps', 1))
         assert a.shape[0] % k == 0, f'batch {a.shape[0]} not divisible by grad_accum_steps {k}'
         loss = 0.0
+        stats = []                                                   # (Pmin, Pmax, target min, target max) per micro-batch
         for a_mb, t_mb in zip(a.chunk(k), target.chunk(k)):
-            mb_loss, _ = self.criterion(self.model(a_mb), t_mb)
+            I_vec = self.model(a_mb)
+            mb_loss, _ = self.criterion(I_vec, t_mb)
+            with torch.no_grad():                                    # batch statistics the min-max readout used
+                P = self.criterion._detector_to_function(I_vec)
+                stats.append((P.min().item(), P.max().item(), t_mb.min().item(), t_mb.max().item()))
             (mb_loss / k).backward()
             loss = loss + mb_loss.detach() / k
 
@@ -209,99 +203,87 @@ class TimeMultiplexedNFATrainer:
         if self.opt_slm is not None:
             self.opt_slm.step()
         self.opt_layers.step()
-        self.opt_readout.step()
         if self.opt_decoder is not None:
             self.opt_decoder.step()
+        if self.opt_readout is not None:
+            self.opt_readout.step()
 
-        return loss.item(), slm_gnorm, layer_gnorm
+        return loss.item(), slm_gnorm, layer_gnorm, stats
 
     @torch.no_grad()
-    def evaluate(self, loader, tag='val', plot=True, n_show=4):
+    def calibrate_minmax(self):
+        '''(Pmin, Pmax) of the frame-averaged intensity over the dense val a-grid and all detectors, eval mode, in chunks of
+        batch_size -- the constants train_readout 'globalminmax' trains against for one epoch (the test's normalisation).'''
+        was_training = self.is_training
+        self._set_mode(False)
+        a = torch.linspace(self.config.a_min, self.config.a_max, self.config.val_a_grid_size, device=self.device)
+        pmin, pmax = float('inf'), float('-inf')
+        for chunk in a.split(int(self.config.batch_size)):
+            P = self.criterion._detector_to_function(self.model(chunk))
+            pmin, pmax = min(pmin, P.min().item()), max(pmax, P.max().item())
+        if was_training:
+            self._set_mode(True)
+        return (torch.tensor(pmin, device=self.device), torch.tensor(pmax, device=self.device))
+
+    @torch.no_grad()
+    def evaluate(self, loader):
         '''
         Single pass over `loader` (typically the dense val/test grid) in eval
-        mode: computes the MSE loss and per-function RMSE (paper Eq. 16-style,
-        approximating the continuous integral with loader's a-samples), and
-        optionally saves a target-vs-approximation curve plot for a handful of
-        representative functions (Fig. 2b/2c-style: best-fit, worst-fit, and a
-        couple spread across the middle of the error distribution).
+        mode: min-max normalizes with Pmin / Pmax over the WHOLE grid and all
+        detectors, then computes the MSE loss and per-function RMSE (paper
+        Eq. 16-style, approximating the continuous integral with loader's a-samples).
 
         Restores whatever train/eval mode the trainer was in before returning.
 
-        Returns (loss, per_function_rmse, diffraction_efficiency) --
+        Returns (loss, per_function_rmse, diffraction_efficiency, (Pmin, Pmax)) --
         per_function_rmse : [Nf] tensor; diffraction_efficiency : float, mean
-        over all samples and phase keys (diagnostic only, see loss.py).
+        over all samples and phase keys (diagnostic only, see loss.py); (Pmin, Pmax)
+        of the frame-averaged intensity over the whole grid.
         '''
         was_training = self.is_training
         self._set_mode(False)
 
-        all_a, all_fhat, all_target = [], [], []
-        total_loss, n_batches = 0.0, 0
+        all_I, all_target = [], []
         de_sum, de_count = 0.0, 0
         incident = self.model.incident_energy()
         for a, target in loader:
-            a = a.to(self.device); target = target.to(self.device)
+            a = a.to(self.device)
             I_vec = self.model(a)
-            loss, f_hat = self.criterion(I_vec, target)
-            total_loss += loss.item(); n_batches += 1
             de = self.criterion.diffraction_efficiency(I_vec, incident)   # [B, T]
             de_sum += de.sum().item(); de_count += de.numel()
-            all_a.append(a.cpu()); all_fhat.append(f_hat.cpu()); all_target.append(target.cpu())
+            all_I.append(self.criterion._detector_to_function(I_vec).cpu()); all_target.append(target)
 
         if was_training:
             self._set_mode(True)
 
-        a_all      = torch.cat(all_a)
-        fhat_all   = torch.cat(all_fhat)
+        I_all      = torch.cat(all_I)                               # [N, Nf] frame-averaged intensity
         target_all = torch.cat(all_target)
+        # targets min-max'd over the SAME grid as f_hat (their 2001-point calibration misses the grid's true range)
+        target_all = self.criterion.normalize(target_all, *self.criterion.minmax_range(target_all))
+        fhat_all   = self.criterion.normalize(I_all, *self.criterion.minmax_range(I_all))
+        loss = torch.mean((fhat_all - target_all) ** 2).item()
         rmse = FunctionApproxLoss.per_function_rmse(fhat_all, target_all)
 
-        if plot:
-            os.makedirs(self.config.image_dir, exist_ok=True)
-            order = torch.argsort(a_all)
-            a_sorted, fhat_sorted, target_sorted = a_all[order], fhat_all[order], target_all[order]
-
-            Nf = rmse.shape[0]
-            order_by_err = torch.argsort(rmse)
-            show_idx = sorted(set(int(order_by_err[i]) for i in
-                                   [0, Nf // 3, 2 * Nf // 3, Nf - 1]))[:n_show]
-
-            fig, axes = plt.subplots(1, len(show_idx), figsize=(4 * len(show_idx), 3.2),
-                                      dpi=150, squeeze=False)
-            for i, k in enumerate(show_idx):
-                ax = axes[0, i]
-                ax.plot(a_sorted.numpy(), target_sorted[:, k].numpy(), '--',
-                         color='tab:green', label='target')
-                ax.plot(a_sorted.numpy(), fhat_sorted[:, k].numpy(), '-.',
-                         color='tab:red', label='approx')
-                ax.set_title(f'f_{k}  (RMSE={rmse[k]:.2e})', fontsize=9)
-                ax.set_xlabel('a'); ax.set_ylim(-0.05, 1.05)
-                if i == 0:
-                    ax.legend(fontsize=7)
-            fig.suptitle(f'Function approximation ({tag}, epoch {self.epoch})  '
-                         f'mean RMSE={rmse.mean():.2e}  max RMSE={rmse.max():.2e}')
-            fig.tight_layout()
-            path = os.path.join(self.config.image_dir, f'function_approx_{tag}_epoch{self.epoch:03d}.png')
-            fig.savefig(path, bbox_inches='tight')
-            plt.close(fig)
-
-        return total_loss / max(n_batches, 1), rmse, de_sum / max(de_count, 1)
+        return loss, rmse, de_sum / max(de_count, 1), tuple(float(v) for v in self.criterion.minmax_range(I_all))
 
     # ---------------------------------------------------------------------- #
 
     def _checkpoint_dict(self):
         return {
             'epoch'    : self.epoch,
+            'best_val_loss': self.best_val_loss,
             'config'   : config_to_dict(self.config),
             'model'    : self.model.state_dict(),
-            'criterion': self.criterion.state_dict(),   # includes the learned scale/bias readout
+            'readout'  : CHECKPOINT_READOUT,   # format marker; checkpoints without it are rejected on load
             'opt_slm'  : self.opt_slm.state_dict()   if self.opt_slm   else None,
             'sched_slm': self.sched_slm.state_dict() if self.sched_slm else None,
             'opt_layers'  : self.opt_layers.state_dict(),
             'sched_layers': self.sched_layers.state_dict(),
-            'opt_readout'  : self.opt_readout.state_dict(),
-            'sched_readout': self.sched_readout.state_dict(),
             'opt_decoder'  : self.opt_decoder.state_dict()   if self.opt_decoder   else None,
             'sched_decoder': self.sched_decoder.state_dict() if self.sched_decoder else None,
+            'criterion'    : self.criterion.state_dict(),   # training-only readout (empty for train_readout minmax)
+            'opt_readout'  : self.opt_readout.state_dict()   if self.opt_readout   else None,
+            'sched_readout': self.sched_readout.state_dict() if self.sched_readout else None,
         }
 
     def save(self, max_keep=5):
@@ -324,8 +306,15 @@ class TimeMultiplexedNFATrainer:
 
     def load(self, ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        check_checkpoint_format(ckpt, ckpt_path)
+        # Shared and per-key decoders are not interchangeable: no warm start / resume across the two
+        dec_saved = ckpt['model'].get('decoder_phases')
+        if self.model.decoder and dec_saved is not None and dec_saved.shape[0] != self.model.n_decoders:
+            raise ValueError(f'{ckpt_path} has {dec_saved.shape[0]} decoder(s), this model has '
+                             f'{self.model.n_decoders} (decoder_per_key={self.model.decoder_per_key}); '
+                             'loading a shared-decoder checkpoint into per-key decoders (or back) is not supported')
         self.model.load_state_dict(ckpt['model'], strict=False)
-        if 'criterion' in ckpt and ckpt['criterion'] is not None:
+        if ckpt.get('criterion'):                     # training-only readout (train_readout affine)
             self.criterion.load_state_dict(ckpt['criterion'], strict=False)
 
         # Weights-only: start a fresh fine-tune from the loaded weights, ignoring the
@@ -359,19 +348,7 @@ class TimeMultiplexedNFATrainer:
             except (ValueError, RuntimeError) as e:
                 print(f'  [warning] sched_layers state skipped: {e}')
 
-        if ckpt.get('opt_readout') is not None:
-            try:
-                self.opt_readout.load_state_dict(ckpt['opt_readout'])
-            except (ValueError, RuntimeError) as e:
-                print(f'  [warning] opt_readout state skipped: {e}')
-
-        if ckpt.get('sched_readout') is not None:
-            try:
-                self.sched_readout.load_state_dict(ckpt['sched_readout'])
-            except (ValueError, RuntimeError) as e:
-                print(f'  [warning] sched_readout state skipped: {e}')
-
-        for name in ('opt_decoder', 'sched_decoder'):
+        for name in ('opt_decoder', 'sched_decoder', 'opt_readout', 'sched_readout'):
             obj = getattr(self, name)
             if obj is not None and ckpt.get(name) is not None:
                 try:
@@ -379,54 +356,12 @@ class TimeMultiplexedNFATrainer:
                 except (ValueError, RuntimeError) as e:
                     print(f'  [warning] {name} state skipped: {e}')
 
-        self.epoch = ckpt['epoch']
-        print(f'  Resumed from epoch {self.epoch}')
+        # the checkpoint was written after epoch ckpt['epoch'] finished (and after its scheduler step)
+        self.epoch = ckpt['epoch'] + 1
+        self.best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        print(f'  Resumed after epoch {ckpt["epoch"]}, continuing at epoch {self.epoch}')
 
     # ---------------------------------------------------------------------- #
-
-    def save_phase_keys(self):
-        '''Grid of the learned phase-key masks, one per key (M total -- the
-        time-multiplexed "wisdom of the crowd" ensembling axis).'''
-        with torch.no_grad():
-            masks = self.model.key_phases().cpu()                 # already in [0, 2pi)
-        M = masks.shape[0]
-
-        fig, axes = plt.subplots(1, M, figsize=(2.2 * M, 2.4), dpi=200, squeeze=False)
-        im = None
-        for m in range(M):
-            ax = axes[0, m]
-            im = ax.imshow(masks[m, 0].numpy(), cmap='twilight', vmin=0, vmax=2 * np.pi)
-            ax.set_title(f'key {m}', fontsize=8)
-            ax.axis('off')
-        cbar = fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02)
-        cbar.set_ticks([0, np.pi, 2 * np.pi])
-        cbar.set_ticklabels(['0', 'π', '2π'])
-        fig.suptitle(f'Phase-key masks  (epoch {self.epoch})')
-        path = os.path.join(self.config.image_dir, f'phase_keys_epoch{self.epoch:03d}.png')
-        fig.savefig(path, bbox_inches='tight')
-        plt.close(fig)
-
-    def save_layer_masks(self):
-        '''Grid of the learned diffractive-layer phase masks (one per layer,
-        shared across all M phase keys).'''
-        with torch.no_grad():
-            masks = (torch.sigmoid(self.model.layer_phases) * 2 * np.pi).cpu()
-        K = masks.shape[0]
-
-        fig, axes = plt.subplots(1, K, figsize=(3 * K, 3), dpi=200, squeeze=False)
-        im = None
-        for k in range(K):
-            ax = axes[0, k]
-            im = ax.imshow(masks[k, 0].numpy(), cmap='twilight', vmin=0, vmax=2 * np.pi)
-            ax.set_title(f'layer {k}', fontsize=8)
-            ax.axis('off')
-        cbar = fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02)
-        cbar.set_ticks([0, np.pi, 2 * np.pi])
-        cbar.set_ticklabels(['0', 'π', '2π'])
-        fig.suptitle(f'Diffractive layer phase masks  (epoch {self.epoch})')
-        path = os.path.join(self.config.image_dir, f'layer_masks_epoch{self.epoch:03d}.png')
-        fig.savefig(path, bbox_inches='tight')
-        plt.close(fig)
 
 
 # --------------------------------------------------------------------------- #
@@ -457,10 +392,9 @@ def main():
         # Explicit override (e.g. resuming into an exact existing run folder) --
         # takes precedence over whatever recompute_derived() just built from run_name.
         config.log_dir     = args.log_dir
-        config.image_dir   = os.path.join(args.log_dir, 'images')
         config.model_dir   = os.path.join(args.log_dir, 'model')
         config.tfboard_dir = os.path.join(args.log_dir, 'tfboard')
-    # else: config.log_dir/image_dir/model_dir/tfboard_dir were already rebuilt from
+    # else: config.log_dir/model_dir/tfboard_dir were already rebuilt from
     # the (possibly overridden) run_name by recompute_derived() above -- config.py is
     # the single source of truth for where a run's output goes, no need to duplicate
     # that construction here.
@@ -470,7 +404,7 @@ def main():
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
 
-    for d in [config.image_dir, config.model_dir, config.tfboard_dir]:
+    for d in [config.model_dir, config.tfboard_dir]:
         os.makedirs(d, exist_ok=True)
 
     # Save config to log_dir/config.json for reference
@@ -480,7 +414,7 @@ def main():
     writer   = SummaryWriter(config.tfboard_dir)
     log_file = os.path.join(config.log_dir, 'LOG.txt')
 
-    train_loader, val_loader, _, target_fn = get_function_approx_dataloaders(config)
+    train_loader, val_loader, _, _ = get_function_approx_dataloaders(config)
     trainer = TimeMultiplexedNFATrainer(config)
     device  = trainer.device
 
@@ -491,14 +425,20 @@ def main():
 
     for epoch in range(trainer.epoch, config.max_epoch):
         trainer.epoch = epoch
+        if trainer.criterion.train_readout == 'globalminmax':      # Pmin / Pmax of the full a-grid, fixed for this epoch
+            trainer.criterion.train_p_range = trainer.calibrate_minmax()
+            writer.add_scalar('minmax/calib_Pmin', float(trainer.criterion.train_p_range[0]), epoch)
+            writer.add_scalar('minmax/calib_Pmax', float(trainer.criterion.train_p_range[1]), epoch)
         trainer._set_mode(training=True)
 
         run_loss = run_slm_gnorm = run_layer_gnorm = 0.0
+        batch_stats = []
         pbar = tqdm(train_loader, desc=f'Epoch {epoch:03d}')
         for a, target in pbar:
             a      = a.to(device)
             target = target.to(device)
-            loss, slm_gn, layer_gn = trainer.train_step(a, target)
+            loss, slm_gn, layer_gn, st = trainer.train_step(a, target)
+            batch_stats += st
             run_loss += loss; run_slm_gnorm += slm_gn; run_layer_gnorm += layer_gn
             pbar.set_postfix({'loss': f'{loss:.3e}'})
 
@@ -508,20 +448,36 @@ def main():
         if trainer.sched_slm is not None:
             trainer.sched_slm.step()
         trainer.sched_layers.step()
-        trainer.sched_readout.step()
         if trainer.sched_decoder is not None:
             trainer.sched_decoder.step()
+        if trainer.sched_readout is not None:
+            trainer.sched_readout.step()
+            writer.add_scalar('readout_train/scale', float(torch.nn.functional.softplus(trainer.criterion._raw_scale)), epoch)
+            writer.add_scalar('readout_train/bias', float(trainer.criterion.bias), epoch)
 
         writer.add_scalar('loss/train',        run_loss,        epoch)
         writer.add_scalar('key_gnorm/train',   run_slm_gnorm,   epoch)
         writer.add_scalar('layer_gnorm/train', run_layer_gnorm, epoch)
+        # Min-max batch statistics (per micro-batch, epoch mean and relative spread): how much the per-batch
+        # normalisation fluctuates, and how far a batch's targets are from the global [0, 1] range
+        bs = np.array(batch_stats)                                   # [n, 4]: Pmin, Pmax, target min, target max
+        writer.add_scalar('minmax/batch_Pmax_mean', bs[:, 1].mean(), epoch)
+        writer.add_scalar('minmax/batch_Pmin_mean', bs[:, 0].mean(), epoch)
+        writer.add_scalar('minmax/batch_Pmax_rel_std', bs[:, 1].std() / max(abs(bs[:, 1].mean()), 1e-30), epoch)
+        writer.add_scalar('minmax/batch_Pmin_over_Pmax_mean', (bs[:, 0] / np.maximum(bs[:, 1], 1e-30)).mean(), epoch)
+        writer.add_scalar('minmax/batch_target_max_mean', bs[:, 3].mean(), epoch)
+        writer.add_scalar('minmax/batch_target_max_min', bs[:, 3].min(), epoch)
+        writer.add_scalar('minmax/batch_target_min_mean', bs[:, 2].mean(), epoch)
 
         if epoch % config.checkpoint_print == 0:
             msg = f'<epoch:{epoch:3d}> loss_train:{run_loss:.3e}\n'
             print_and_save_msg(msg, log_file)
 
         if epoch % config.checkpoint_save == 0 or epoch == config.max_epoch - 1:
-            val_loss, rmse, val_de = trainer.evaluate(val_loader, tag='val', plot=False)
+            val_loss, rmse, val_de, (val_pmin, val_pmax) = trainer.evaluate(val_loader)
+            writer.add_scalar('minmax/val_Pmax', val_pmax, epoch)
+            writer.add_scalar('minmax/val_Pmin', val_pmin, epoch)
+            writer.add_scalar('minmax/batch_Pmax_over_val_Pmax', bs[:, 1].mean() / max(val_pmax, 1e-30), epoch)
 
             writer.add_scalar('loss/val',      val_loss,           epoch)
             writer.add_scalar('rmse/val_mean', rmse.mean().item(), epoch)

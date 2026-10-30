@@ -1,19 +1,22 @@
 '''
 Time-Multiplexed NFA Model (Nonlinear Function Approximation)
 
-Physical path: phase-key plane (learned, T == M keys, time-multiplexed) ->
-propagate (key_to_enc_spacing) -> function-input encoding plane
-(deterministic, phi_in(p;a) = 2*pi*encoding_freq_step*(p-1)*a over an
-Np-pixel patch, NOT learned -- see _encode_input) -> propagate
-(slm_first_layer_spacing) -> K learned diffractive layers (shared across all
-M keys) -> propagate -> detector plane.
+Physical path, per frame m = 1..M: plane wave -> phase key m (learned, key SLM) -> propagate (key_to_enc_spacing) ->
+encoding plane (encoding SLM): encoding phase phi_in(p; a) = 2*pi*alpha_p*a on the Np-pixel patch (+ copies), alpha_p =
+(p - harmonic_shift) * encoding_freq_step, NOT learned (see _encode_input), plus the learned E+D decoder phase (one
+shared or one per key) -> propagate -> K learned diffractive layers (shared by all frames; K = 0 in the lab setup) ->
+propagate -> camera. Every SLM phase can be quantised to 2^slm_phase_bits levels (_quantize).
+At K > 0 the non-encoding pixels of the encoding plane are opaque (only the encoding pixels pass light); at K = 0 they
+are transparent.
 
-Detector: a pd_num_rows x pd_num_cols photodiode array, one intensity
-reading per target function (pd_num_rows * pd_num_cols == config.Nf -- no
-more positive/negative differential pairing, that was classification-era,
-see loss.py). forward()/measure() return the raw per-detector intensity
-array I_vec : [B, T, pd_num_rows, pd_num_cols]; summing over the M (== T)
-phase-key axis and normalizing into f_hat(a) is done downstream in loss.py.
+Pixels -> sim grid (2026-10-25): each SLM plane is a pixel array at its own pitch (key_slm_dx for the keys, enc_slm_dx
+for encoding + decoder and the layers). _AxisRaster maps it onto the sim grid at its exact physical size: a sim px that
+straddles a pixel edge gets the area-weighted mix of exp(j phi) of the pixels it overlaps. With a whole number of sim
+px per SLM px the weights are 0 / 1 and this is the old nearest-neighbour binning, bit for bit.
+
+Detector: a pd_num_rows x pd_num_cols array, one intensity reading per target function (pd_num_rows * pd_num_cols ==
+Nf). forward() returns the raw per-detector intensity I_vec : [B, T, pd_num_rows, pd_num_cols] (T == M); averaging
+over the M frames and the readout to f_hat(a) (training: config.train_readout; val / test: min-max) happen in loss.py.
 '''
 
 import sys, os
@@ -25,7 +28,59 @@ import numpy as np
 import torch.nn.functional as F
 
 from wave_prop import FreeSpaceProp
-from config import encoding_tile_cells
+from config import encoding_tile_cells, footprint
+
+# --------------------------------------------------------------------------- #
+#  Pixel array -> sim grid                                                     #
+# --------------------------------------------------------------------------- #
+
+class _AxisRaster(nn.Module):
+    '''One axis of a pixel array (n_px pixels of `ratio` sim px each, the first starting at sim coordinate `start`,
+    in sim px, may be fractional or negative) on an N-cell sim axis. ratio >= 1, so every sim cell overlaps at most two
+    pixels: cell i gets w0[i] * px[idx0[i]] + w1[i] * px[idx1[i]] (w = overlap / cell width; 0 outside the array).
+    Buffers are not saved in checkpoints: the geometry is rebuilt from the config.'''
+
+    def __init__(self, n_px, ratio, start, N):
+        super().__init__()
+        assert ratio >= 1 - 1e-9, f'sim px larger than the SLM px (ratio {ratio})'
+        i = np.arange(N, dtype=np.float64)
+        j0 = np.floor((i - start) / ratio + 1e-9).astype(np.int64)        # pixel under the cell's left edge
+        w = []
+        for j in (j0, j0 + 1):
+            lo = np.maximum(i, start + j * ratio)
+            hi = np.minimum(i + 1, start + (j + 1) * ratio)
+            ov = np.clip(hi - lo, 0, 1)
+            ov[(j < 0) | (j >= n_px)] = 0
+            ov[np.abs(ov) < 1e-9] = 0; ov[np.abs(ov - 1) < 1e-9] = 1    # exact 0 / 1 (whole-number ratios: plain binning)
+            w.append(ov)
+        self.register_buffer('idx0', torch.from_numpy(np.clip(j0, 0, n_px - 1)), persistent=False)
+        self.register_buffer('idx1', torch.from_numpy(np.clip(j0 + 1, 0, n_px - 1)), persistent=False)
+        self.register_buffer('w0', torch.from_numpy(w[0]).float(), persistent=False)
+        self.register_buffer('w1', torch.from_numpy(w[1]).float(), persistent=False)
+        self.two = bool((self.w1 > 0).any())                               # False: plain binning, one gather is enough
+        self.register_buffer('coverage', self.w0 + self.w1, persistent=False)   # [N] fraction of each cell covered
+
+    def forward(self, x, dim):
+        '''x [..., n_px along dim, ...] -> [..., N along dim, ...]'''
+        shape = [1] * x.dim(); shape[dim] = -1
+        out = x.index_select(dim, self.idx0) * self.w0.view(shape)
+        if self.two:
+            out = out + x.index_select(dim, self.idx1) * self.w1.view(shape)
+        return out
+
+
+def _raster(x, ry, rx):
+    '''Pixel array x [..., ny, nx] (real or complex) -> sim grid [..., N, N], separable (rows, then columns).'''
+    return rx(ry(x, -2), -1)
+
+
+def _raster_phase(phi, ry, rx):
+    '''Phase pixel array -> sim-grid phase for FIGURES: angle of the rasterised exp(j phi), so a cell straddling two
+    pixels shows the phase of their mixed field (mixing the phase values themselves ignores the 2pi wrap); 0 off the array.'''
+    U = _raster(torch.exp(1j * phi), ry, rx)
+    cov = ry.coverage[:, None] * rx.coverage[None, :]
+    return torch.where(cov > 0, torch.angle(U), torch.zeros_like(U.real))   # angle(-0 - 0j) = -pi off the array
+
 
 # --------------------------------------------------------------------------- #
 #  Main model                                                                  #
@@ -41,42 +96,34 @@ class TimeMultiplexedNFA(nn.Module):
         self.N_sim         = config.N_sim
         self.sim_dx        = config.sim_dx
         self.meas_noise_std = float(getattr(config, 'meas_noise_std', 0.0))
+        self.phase_slm_noise_std = float(getattr(config, 'phase_slm_noise_std', 0.0))   # rad; absent in pre-10-29 configs
+        bd = getattr(config, 'slm_phase_bits', 'inf')       # 'inf' = continuous SLM phase, int b = 2^b levels
+        self.slm_levels = None if bd == 'inf' else 2 ** int(bd)
 
-        # Phase-key geometry (the key is displayed on the SLM, hence slm_dx/slm_hw_*)
-        self.phase_key_size     = config.phase_key_size
-        self.phase_key_bin      = config.phase_key_bin
-        self.phase_key_size_sim = config.phase_key_size_sim
-        self.slm_hw_x      = getattr(config, 'slm_hw_x', config.phase_key_size)
-        self.slm_hw_y      = getattr(config, 'slm_hw_y', config.phase_key_size)
+        # Phase-key geometry: key SLM pixels (key_slm_dx = key_ratio sim px each)
+        self.phase_key_size     = config.phase_key_size # key SLM px per side
+        self.phase_key_size_sim = config.phase_key_size_sim # key sim px per side
+        self.key_ratio          = config.key_ratio # key SLM px / sim px
+        self.enc_ratio          = config.enc_ratio # enc SLM px / sim px encoding + decoder SLM, and the layers
 
-        # Function-input encoding-plane geometry
-        self.encoding_bin       = config.encoding_bin
+        # Function-input encoding-plane geometry (encoding SLM px)
         self.encoding_rows      = config.encoding_rows # # of rows in the encoding patch encoding_rows x encoding_cols = Np
         self.encoding_cols      = config.encoding_cols # # of columns in the encoding patch encoding_rows x encoding_cols = Np
         self.encoding_y_num_sim = config.encoding_y_num_sim # height in sim px of one patch copy (including gaps)
         self.encoding_x_num_sim = config.encoding_x_num_sim # width in sim px of one patch copy (including gaps)
+        self.encoding_extent_sim = config.encoding_extent_sim # all patch copies together, sim px (asserts, figure zooms)
         self.encoding_freq_step = float(getattr(config, 'encoding_freq_step', 1))
         self.encoding_gap_blocks = int(getattr(config, 'encoding_gap_blocks', 0))
-
-        if (getattr(config, 'encoding_order', 'raster') != 'raster'
-                or bool(getattr(config, 'encoding_reverse_order', False))):
-            raise NotImplementedError('encoding_order / encoding_reverse_order support was removed '
-                                      '2026-10-10 (raster layout only)')
-
-        self.encoding_mode = getattr(config, 'encoding_mode', 'constant')
-        self.Np = int(config.Np)
-        self.N_alpha = int(getattr(config, 'N_alpha', self.Np))
-        self.encoding_tile_pattern = getattr(config, 'encoding_tile_pattern', 'single') # copies of the input patch placed in a 3x3 or 5x5 grid
-        gap_px = self.encoding_bin * self.encoding_gap_blocks
-        pitch_y, pitch_x = self.encoding_y_num_sim + gap_px, self.encoding_x_num_sim + gap_px # seperation between patch copes in sim px
-        self.encoding_tile_shifts = [(r * pitch_y, c * pitch_x) for r, c in encoding_tile_cells(self.encoding_tile_pattern)] # locations of all patch copies in sim px relative to the centred patch
-        reach_y = max(abs(dy) for dy, _ in self.encoding_tile_shifts)
-        reach_x = max(abs(dx) for _, dx in self.encoding_tile_shifts)
-        # extent = larger of the copies' total height / width (used for asserts and figure zooms)
-        self.encoding_extent_sim = max(self.encoding_y_num_sim + 2 * reach_y,
-                                       self.encoding_x_num_sim + 2 * reach_x) # maximum extent in sim px of all patch copies together in input plane
         assert self.encoding_extent_sim <= self.N_sim, \
             f'encoding copies span {self.encoding_extent_sim} px > N_sim {self.N_sim}'
+
+        self.encoding_mode = getattr(config, 'encoding_mode', 'constant') # split encoding vs constant
+        self.Np = int(config.Np)
+        self.N_alpha = int(getattr(config, 'N_alpha', self.Np))
+        self.harmonic_shift = int(getattr(config, 'harmonic_shift', 0))   # targets: alpha_i = (i - harmonic_shift) * freq_step
+        # displayed encoding: alpha_p = (p - encoding_shift) * freq_step (= harmonic_shift unless encoding_zero_based)
+        self.encoding_shift = int(getattr(config, 'encoding_shift', self.harmonic_shift)) # [-Np//2 ..] or [0 .. Np-1]
+        self.encoding_tile_pattern = getattr(config, 'encoding_tile_pattern', 'single') # copies of the input patch placed in a 3x3 or 5x5 grid
 
         # Photodiode array
         self.pd_px          = config.photodiode_pixels
@@ -118,69 +165,104 @@ class TimeMultiplexedNFA(nn.Module):
             nn.init.normal_(slm_init, mean=0.0, std=std)
         self.slm_phases = nn.Parameter(slm_init)
 
-        # Learnable diffractive layers
+        N = self.N_sim
+        centred = lambda n, ratio: (N - footprint(n, ratio)) // 2      # first sim px of a centred n-px array
+        outer = lambda r: (r.coverage[:, None] * r.coverage[None, :])[None, None]   # [1, 1, N, N] 2D coverage
+
+        # Learnable diffractive layers (pixels at the encoding-SLM pitch; zero field outside the layer)
         self.num_layers      = getattr(config, 'num_layers', 0)
-        self.layer_bin       = getattr(config, 'layer_bin', 1)
-        self.layer_size_sim  = getattr(config, 'layer_size_sim', config.layer_size)
+        self.layer_size_sim  = config.layer_size_sim
         layers_init = torch.zeros(self.num_layers, 1, config.layer_size, config.layer_size)
         self.layer_phases = nn.Parameter(layers_init)
         assert self.layer_size_sim <= self.N_sim, \
             'Diffractive layer extends outside the simulation grid'
+        if self.num_layers > 0:
+            self.ras_layer = _AxisRaster(config.layer_size, self.enc_ratio, centred(config.layer_size, self.enc_ratio), N)
 
-        # SLM aperture (currently just an array full of ones)
-        ap_h = min(self.slm_hw_y * self.phase_key_bin, self.N_sim)
-        ap_w = min(self.slm_hw_x * self.phase_key_bin, self.N_sim)
-        aperture = torch.zeros(1, 1, self.N_sim, self.N_sim)
-        y0 = (self.N_sim - ap_h) // 2;  y1 = y0 + ap_h
-        x0 = (self.N_sim - ap_w) // 2;  x1 = x0 + ap_w
-        aperture[..., y0:y1, x0:x1] = 1.0
-        self.register_buffer('slm_aperture', aperture)
+        # Key SLM: the keys on their pixels; the rest of the illuminated SLM area (slm_hw_y x slm_hw_x px, clipped to the
+        # grid) passes flat phase
+        self.ras_key = _AxisRaster(self.phase_key_size, self.key_ratio, centred(self.phase_key_size, self.key_ratio), N)
+        hw_y, hw_x = int(getattr(config, 'slm_hw_y', self.phase_key_size)), int(getattr(config, 'slm_hw_x', self.phase_key_size))
+        ap_y = _AxisRaster(hw_y, self.key_ratio, centred(hw_y, self.key_ratio), N)
+        ap_x = _AxisRaster(hw_x, self.key_ratio, centred(hw_x, self.key_ratio), N)
+        self.register_buffer('slm_aperture', (ap_y.coverage[:, None] * ap_x.coverage[None, :])[None, None],
+                             persistent=False)
+        self.register_buffer('key_coverage', outer(self.ras_key), persistent=False)
 
-        # Layer aperture
-        layer_ap = torch.zeros(1, 1, self.N_sim, self.N_sim)
-        ly0 = (self.N_sim - self.layer_size_sim) // 2
-        ly1 = ly0 + self.layer_size_sim
-        layer_ap[..., ly0:ly1, ly0:ly1] = 1.0   # square aperture, same centering both axes
-        self.register_buffer('layer_aperture', layer_ap)
+        # Encoding SLM: one pixel array holds the encoding patch (+ tile copies, all in encoding-SLM px) and the decoder.
+        # The centred patch starts at sim px (N - h) // 2; the centred decoder square is shifted by < 1 SLM px so both
+        # share one pixel grid (as before 2026-10-25); the array spans both.
+        s = int(config.encoding_patch_scale); G = s * self.encoding_gap_blocks      # SLM px per encoding px / per gap
+        ph, pw = int(config.encoding_y_num_px), int(config.encoding_x_num_px)       # one patch copy, SLM px
+        shifts = [(r * (ph + G), c * (pw + G)) for r, c in encoding_tile_cells(self.encoding_tile_pattern)]
+        self.encoding_tile_shifts = [(round(dy * self.enc_ratio), round(dx * self.enc_ratio)) for dy, dx in shifts]   # sim px (figures)
+        enc0 = ((N - footprint(ph, self.enc_ratio)) // 2, (N - footprint(pw, self.enc_ratio)) // 2)
+        lo = [min(d[i] for d in shifts) for i in (0, 1)]                # array bounds, SLM px from the patch origin
+        hi = [max(d[i] for d in shifts) + (ph, pw)[i] for i in (0, 1)]
 
-        # Decoder (E+D architecture): a learnable phase mask shown on the SLM pixels of the encoding plane that are NOT
-        # encoding pixels (gaps inside each patch, gaps between copies, surroundings), shared by all M frames.
-        # Phase stored directly (no sigmoid), initialised to 0 -> a fresh decoder leaves the model unchanged.
+        # Decoder (E+D architecture): a learnable phase mask on the encoding SLM (every pixel of its square with
+        # decoder_over_encoding, else only the non-encoding ones). decoder_per_key: one decoder per frame (decoder m shown
+        # with key m), else one shared by all M frames. Phase stored directly (no sigmoid), initialised to 0.
         self.decoder = bool(getattr(config, 'decoder', False))
+        self.decoder_per_key = self.decoder and bool(getattr(config, 'decoder_per_key', False))
+        self.n_decoders = self.M if self.decoder_per_key else 1
         if self.decoder:
-            s = self.phase_key_bin                                    # sim px per SLM px
-            self.decoder_size = int(config.decoder_size_px)           # SLM px per side
-            self.decoder_size_sim = self.decoder_size * s
-            assert self.decoder_size_sim <= self.N_sim, 'Decoder extends outside the simulation grid'
-            # Encoding and decoder pixels share one SLM pixel grid: shift the (centred) decoder by < 1 SLM px so its
-            # pixel edges line up with the encoding pixels' edges (the centred patch starts at (N_sim - h) // 2)
-            def _aligned_start(enc_extent):
-                enc0 = (self.N_sim - enc_extent) // 2
-                d0 = (self.N_sim - self.decoder_size_sim) // 2
-                d0 += (enc0 - d0) % s
-                return d0 - s if d0 + self.decoder_size_sim > self.N_sim else d0
-            self.decoder_y0 = _aligned_start(self.encoding_y_num_sim)
-            self.decoder_x0 = _aligned_start(self.encoding_x_num_sim)
-            self.decoder_phases = nn.Parameter(torch.zeros(1, 1, self.decoder_size, self.decoder_size))
-            # 1 inside the decoder square, 0 on every encoding pixel (all tile copies) and outside the square
-            dec_mask = torch.zeros(1, 1, self.N_sim, self.N_sim)
-            dec_mask[..., self.decoder_y0:self.decoder_y0 + self.decoder_size_sim,
-                     self.decoder_x0:self.decoder_x0 + self.decoder_size_sim] = 1.0
-            enc_px = self._patch_to_sim(torch.ones(1, 1, self.encoding_rows, self.encoding_cols)) > 0.5
+            D = self.decoder_size = int(config.decoder_size_px)           # SLM px per side
+            self.decoder_size_sim = config.decoder_size_sim
+            assert self.decoder_size_sim <= N, 'Decoder extends outside the simulation grid'
+            d_org = []
+            for i in (0, 1):
+                d0 = (N - footprint(D, self.enc_ratio)) // 2
+                o = int(np.floor((enc0[i] - d0) / self.enc_ratio + 1e-9))   # patch origin - decoder origin, SLM px
+                if enc0[i] - o * self.enc_ratio + D * self.enc_ratio > N + 1e-6:
+                    o += 1                                                  # keep the decoder on the grid
+                d_org.append(-o); lo[i] = min(lo[i], -o); hi[i] = max(hi[i], -o + D)
+        ny, nx = hi[0] - lo[0], hi[1] - lo[1]
+        self.enc_px_shape = (ny, nx)
+        self.ras_enc_y = _AxisRaster(ny, self.enc_ratio, enc0[0] + lo[0] * self.enc_ratio, N)
+        self.ras_enc_x = _AxisRaster(nx, self.enc_ratio, enc0[1] + lo[1] * self.enc_ratio, N)
+        self.register_buffer('enc_coverage', self.ras_enc_y.coverage[:, None] * self.ras_enc_x.coverage[None, :],
+                             persistent=False)
+        # enc_src[y, x] = harmonic p shown by that SLM px (Np = none); harmonic p sits at row p // cols, column p % cols
+        src = torch.full((ny, nx), self.Np, dtype=torch.long)
+        for dy, dx in shifts:
+            for i in range(self.encoding_rows):
+                for j in range(self.encoding_cols):
+                    y, x = dy - lo[0] + i * (s + G), dx - lo[1] + j * (s + G)
+                    src[y:y + s, x:x + s] = i * self.encoding_cols + j
+        self.register_buffer('enc_src', src.reshape(-1), persistent=False)
+        self.register_buffer('enc_mask_px', (src < self.Np).float(), persistent=False)   # [ny, nx] 1 on encoding px
+        if self.decoder:
+            self.dec_y0, self.dec_x0 = d_org[0] - lo[0], d_org[1] - lo[1]   # decoder square in the array, SLM px
+            dm = torch.zeros(ny, nx)
+            dm[self.dec_y0:self.dec_y0 + D, self.dec_x0:self.dec_x0 + D] = 1.0
             if not getattr(config, 'decoder_over_encoding', False):   # True: decoder also adds phase on the encoding pixels
-                dec_mask[enc_px] = 0.0
-            self.register_buffer('decoder_mask', dec_mask, persistent=False)
+                dm[src < self.Np] = 0.0
+            self.register_buffer('decoder_mask_px', dm, persistent=False)
+            self.decoder_phases = nn.Parameter(torch.zeros(self.n_decoders, 1, D, D))
+
+        # Background (2026-10-23, fixed): with K > 0 every encoding-plane pixel that is NOT an encoding pixel (in any tile
+        # copy) is opaque, so only the encoding pixels pass light and there is no a-independent DC term; the layers do the
+        # rest. At K = 0 (lab E+D) the background stays transparent. background_amp (sim grid, figures) is None then.
+        self.opaque_background = bool(getattr(config, 'opaque_background', self.num_layers > 0))   # config.background_opaque
+        if self.opaque_background:
+            if self.decoder and not getattr(config, 'decoder_over_encoding', False):
+                raise ValueError('decoder=True with decoder_over_encoding=False at K > 0: the background is opaque, so this '
+                                 'decoder would act only on blocked pixels; set decoder_over_encoding=True')
+            self.register_buffer('background_amp', _raster(self.enc_mask_px, self.ras_enc_y, self.ras_enc_x)[None, None],
+                                 persistent=False)   # [1, 1, N_sim, N_sim], 1 on encoding px
+        else:
+            self.background_amp = None
 
         # Free-space propagators
         self.prop_key_to_enc = FreeSpaceProp(config, z=config.key_to_enc_spacing)
         self.key_to_enc_exact = (float(config.key_to_enc_spacing) == 0.0
                                  and bool(getattr(config, 'key_to_enc_exact_at_zero', True)))
-        if (self.num_layers > 0):
+        if self.num_layers > 0:
             self.prop_to_layer1  = FreeSpaceProp(config, z=config.slm_first_layer_spacing)
             self.prop_interlayer = FreeSpaceProp(config, z=config.interlayer_spacing)
-            self.prop_to_ccd     = FreeSpaceProp(config, z=config.last_layer_ccd_spacing)
-        else:
-            self.prop_to_ccd     = FreeSpaceProp(config, z=config.last_layer_ccd_spacing)
+        # last layer -> camera; at K = 0 this is the encoding plane -> camera distance
+        self.prop_to_ccd = FreeSpaceProp(config, z=config.last_layer_ccd_spacing)
 
     # ---------------------------------------------------------------------- #
 
@@ -195,19 +277,29 @@ class TimeMultiplexedNFA(nn.Module):
         pad_right  = pad_w - pad_left
         return F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
 
+    def _quantize(self, phi):
+        # SLM bit depth: wrap to [0, 2pi) and round to slm_levels equally spaced levels. Straight-through estimator:
+        # the forward pass sees the quantised phase, the gradient passes as if continuous. No rounding when slm_levels is None.
+        # Training only (phase_slm_noise_std > 0): fresh Gaussian phase noise (rad) on every displayed SLM px, after the
+        # rounding, at any bit depth; val / test / figures see the noiseless phase.
+        noise = torch.randn_like(phi) * self.phase_slm_noise_std if self.training and self.phase_slm_noise_std > 0 else 0.0
+        if self.slm_levels is None:
+            return phi + noise
+        step = 2 * np.pi / self.slm_levels
+        q = torch.remainder(torch.round(torch.remainder(phi, 2 * np.pi) / step), self.slm_levels) * step
+        return phi + (q - phi).detach() + noise
+
     def key_phases(self):
-        return torch.sigmoid(self.slm_phases) * (2 * np.pi)
+        return self._quantize(torch.sigmoid(self.slm_phases) * (2 * np.pi))
 
     def _get_slm_field(self):
-        #embeds the M learned phase keys into sim grid, and performs binning if necessary
-        phi = self.key_phases()
-        if self.phase_key_bin != 1:
-            phi = F.interpolate(
-                phi,
-                size=(self.phase_key_size_sim, self.phase_key_size_sim),
-                mode='nearest'
-            )
-        return self._embed_in_sim(phi)
+        # key phases on the sim grid [M, 1, N_sim, N_sim] (figures; 0 outside the key, area-mixed at pixel edges)
+        return _raster_phase(self.key_phases(), self.ras_key, self.ras_key)
+
+    def _key_field(self):
+        # key plane field [M, 1, N_sim, N_sim]: exp(j key) on the key pixels, flat phase on the rest of the illuminated SLM
+        U = _raster(torch.exp(1j * self.key_phases()), self.ras_key, self.ras_key)
+        return self.slm_aperture * (U + (1 - self.key_coverage))
 
     def incident_energy(self):
         # Sums the incident intensity over the larger of the phase-key and first-layer footprints.
@@ -218,82 +310,74 @@ class TimeMultiplexedNFA(nn.Module):
     def key_intensity_at_encoding(self):
         # returns intensity distribution at the input encoding plane per phase key
         # Returns tensor [T, N_sim, N_sim]
-        U = self._key_to_encoding(self.slm_aperture * torch.exp(1j * self._get_slm_field()))[:, 0]
+        U = self._key_to_encoding(self._key_field())[:, 0]
         return U.abs().pow(2), U.angle()
 
     def _key_to_encoding(self, U_key):
         # Propagate the phase_key to the input encoding plane. If z = 0, no propagator (copy key field to input plane) so input plane field is exp(j*(phi_key + phi_encoding))
         return U_key if self.key_to_enc_exact else self.prop_key_to_enc(U_key)
 
-    def _encode_input(self, a):
-        # Returns encoding-plane phases [B, F, N_sim, N_sim]: F = 1 in 'constant' mode (every frame shows all Np harmonics, broadcast over the M keys in forward), 
-        # F = M in 'split' mode (frame m shows harmonics m*Np .. (m+1)*Np-1 only).
-        # Harmonic p has phase 2*pi*p*freq_step*a and sits at row p // cols, column p % col (raster) of the rows x cols patch; _patch_to_sim then adds gaps, bins and embeds.
+    def _encode_px(self, a):
+        # Encoding phases on the encoding-SLM pixel array [B, F, ny, nx] (0 off the encoding pixels): F = 1 in 'constant'
+        # mode (every frame shows all Np harmonics, broadcast over the M keys in forward), F = M in 'split' mode (frame m
+        # shows harmonics m*Np .. (m+1)*Np-1 only). Harmonic p has phase 2*pi*alpha_p*a and sits at row p // cols,
+        # column p % cols of the rows x cols patch, in every tile copy (enc_src).
         B = a.shape[0]
         rows, cols = self.encoding_rows, self.encoding_cols
         n_harm = self.N_alpha if self.encoding_mode == 'split' else rows * cols
-        p_idx = torch.arange(n_harm, device=a.device, dtype=a.dtype)
+        p_idx = torch.arange(n_harm, device=a.device, dtype=a.dtype) - self.encoding_shift   # centered: -N_alpha//2 ..; else 0 ..
         alphas = p_idx * self.encoding_freq_step                     # [n_harm]
-        phi_h = 2 * np.pi * torch.einsum('b,p->bp', a, alphas)       # [B, n_harm]: [2pi(0)a, 2pi(1)a, ...] phase correspodning to each harmonic
+        phi_h = 2 * np.pi * torch.einsum('b,p->bp', a, alphas)       # [B, n_harm]: phase 2*pi*alpha_i*a of each harmonic
 
         if self.encoding_mode == 'constant':
             phi_flat = phi_h[:, None, :]                             # [B, 1, Np]: same input for every frame
         else:
             # split: frame m shows its own Np harmonics on the same Np-pixel patch
             phi_flat = phi_h.reshape(B, self.M, rows * cols)         # [B, M, Np]
-        Fr = phi_flat.shape[1]
-        phi_px = phi_flat.reshape(B, Fr, rows, cols)                  # [B, F, rows, cols], raster order
-        return self._patch_to_sim(phi_px)
+        phi_flat = torch.cat([phi_flat, phi_flat.new_zeros(*phi_flat.shape[:2], 1)], -1)   # index Np = no harmonic
+        return phi_flat[..., self.enc_src].reshape(*phi_flat.shape[:2], *self.enc_px_shape)
 
-    def _patch_to_sim(self, x):
-        # x: [B, F, rows, cols]. Returns [B, F, N_sim, N_sim].
-        rows, cols = x.shape[-2:]
-        gap = self.encoding_gap_blocks
-        if gap > 0: # inserts gaps
-            cell = x.new_zeros(*x.shape[:-2], rows + (rows - 1) * gap, cols + (cols - 1) * gap)
-            ir = torch.arange(rows, device=x.device) * (1 + gap)      # where the real pixels go
-            ic = torch.arange(cols, device=x.device) * (1 + gap)
-            cell[..., ir[:, None], ic[None, :]] = x                   # zeros left in between
-            x = cell
-        if self.encoding_bin != 1: # bins each pixel to encoding_bin x encoding_bin sim px
-            x = F.interpolate(x, size=(self.encoding_y_num_sim, self.encoding_x_num_sim), mode='nearest')
-        # everything above creates a single patch of size encoding_y_num_sim x encoding_x_num_sim with correct gaps
-        # below then embeds the patch in sim and adds the tile copies 
-        return self._tile_encoding(self._embed_in_sim(x))
+    def _raster_enc_mask(self):
+        return _raster(self.enc_mask_px, self.ras_enc_y, self.ras_enc_x)     # [N, N] encoding-pixel coverage
 
-    def _tile_encoding(self, x):
-        # x: [..., N_sim, N_sim] with the patch centred. Returns the sum of shifted copies
-        if len(self.encoding_tile_shifts) == 1 and self.encoding_tile_shifts[0] == (0, 0):
-            return x
-        return sum(torch.roll(x, shifts=s, dims=(-2, -1)) for s in self.encoding_tile_shifts) # shift each copy by (dy, dx) in sim px and sum
+    def _encode_input(self, a):
+        # encoding phases on the sim grid [B, F, N_sim, N_sim] (figures)
+        return _raster_phase(self._encode_px(a), self.ras_enc_y, self.ras_enc_x) * (self._raster_enc_mask() > 0)
 
-    def _decoder_phase_sim(self):
-        # Decoder phase on the sim grid [1, 1, N_sim, N_sim]: SLM px -> sim px, placed on the aligned decoder square,
-        # zero on the encoding pixels and outside the square
-        phi = self.decoder_phases
-        if self.phase_key_bin != 1:
-            phi = F.interpolate(phi, size=(self.decoder_size_sim, self.decoder_size_sim), mode='nearest')
-        y0, x0, D = self.decoder_y0, self.decoder_x0, self.decoder_size_sim
-        phi = F.pad(phi, (x0, self.N_sim - x0 - D, y0, self.N_sim - y0 - D))
-        return phi * self.decoder_mask
+    def decoder_phases_px(self):
+        # Decoder phases on the encoding-SLM pixel array [1, n_decoders, ny, nx] (n_decoders = M per key, else 1), zero
+        # outside the decoder square (and on the encoding pixels unless decoder_over_encoding)
+        ny, nx = self.enc_px_shape
+        D, y0, x0 = self.decoder_size, self.dec_y0, self.dec_x0
+        phi = F.pad(self.decoder_phases, (x0, nx - x0 - D, y0, ny - y0 - D))   # [n_decoders, 1, ny, nx]
+        return (phi * self.decoder_mask_px).transpose(0, 1)
 
-    def _input_plane_phase(self, a):
-        # Total phase shown at the encoding plane [B, F, N_sim, N_sim]: encoding phases (+ decoder phases, if enabled)
-        phi = self._encode_input(a)
+    def _input_plane_px(self, a):
+        # Total phase shown by the encoding SLM [B, F, ny, nx]: encoding phases (+ decoder phases, if enabled).
+        # F = 1 (constant, shared decoder) or M (split, and/or one decoder per key): [B, 1 or M] + [1, 1 or M] broadcasts
+        phi = self._encode_px(a)
         if self.decoder:
-            phi = phi + self._decoder_phase_sim()
-        return phi
+            phi = phi + self.decoder_phases_px()
+        return self._quantize(phi)              # the SLM displays encoding + decoder as one quantised pattern
+
+    def input_plane_field(self, a):
+        # Encoding-plane modulation on the sim grid [B, F, N_sim, N_sim]. K > 0: opaque background, only the encoding
+        # pixels pass light; K = 0: transparent (unit field off the encoding SLM's pixel array)
+        E = torch.exp(1j * self._input_plane_px(a))
+        if self.opaque_background:
+            return _raster(E * self.enc_mask_px, self.ras_enc_y, self.ras_enc_x)
+        return _raster(E, self.ras_enc_y, self.ras_enc_x) + (1 - self.enc_coverage)
+
+    def _layer_phase_px(self, k):
+        return self._quantize(torch.sigmoid(self.layer_phases[k:k+1]) * (2 * np.pi))   # [1, 1, layer_size, layer_size]
 
     def _get_layer_phase(self, k):
-        # returns kth layer's phase, embeds in sim with binning if necessary
-        phi = torch.sigmoid(self.layer_phases[k:k+1]) * (2 * np.pi)   # [1, 1, layer_size, layer_size]
-        if self.layer_bin != 1:
-            phi = F.interpolate(
-                phi,
-                size=(self.layer_size_sim, self.layer_size_sim),
-                mode='nearest'
-            )
-        return self._embed_in_sim(phi)                                 # [1, 1, N_sim, N_sim]
+        # kth layer's phase on the sim grid [1, 1, N_sim, N_sim] (figures)
+        return _raster_phase(self._layer_phase_px(k), self.ras_layer, self.ras_layer)
+
+    def _layer_field(self, k):
+        # kth layer's transmission on the sim grid [1, 1, N_sim, N_sim] (zero outside the layer)
+        return _raster(torch.exp(1j * self._layer_phase_px(k)), self.ras_layer, self.ras_layer)
 
     def _integrate_photodiode_array(self, I_ccd):
         # Using pre computed detector center locations, averages intensity over each detector's pd_px x pd_px footprint
@@ -317,22 +401,21 @@ class TimeMultiplexedNFA(nn.Module):
 
     # ---------------------------------------------------------------------- #
 
-    def forward(self, a, return_field=False):
+    def forward(self, a):
         '''
         a : [B] real tensor of scalar function-input values.
-        Returns I_vec : [B, T, pd_num_rows, pd_num_cols]  (T == M phase keys)
+        Returns I_vec : [B, T, pd_num_rows, pd_num_cols]  (T == M phase keys); with meas_noise_std > 0 and in training
+        mode, Gaussian detector noise is added (_add_meas_noise).
         '''
         B = a.shape[0]
-        phi_in_sim  = self._input_plane_phase(a) # encoding plane phases (+ decoder) [B, F, N_sim, N_sim], F = 1 (constant, same encoding for all M keys) or M (split, encoding differs for each key)
-        phi_slm_sim = self._get_slm_field() # key plane phases [M, 1, N_sim, N_sim]
-
         # Phase-key plane -> input plane
-        U_key        = self.slm_aperture * torch.exp(1j * phi_slm_sim) # [T, 1, N_sim, N_sim]
+        U_key        = self._key_field() # [T, 1, N_sim, N_sim]
         U_at_enc     = self._key_to_encoding(U_key) # [T, 1, N_sim, N_sim] either propagated or copied (z=0) to the input plane
         U_at_enc_exp = U_at_enc[:, 0, :, :].unsqueeze(0) # [1, T, N_sim, N_sim]
 
-        # Input plane perturbation
-        U_input = torch.exp(1j * phi_in_sim)                         # [B, F, N_sim, N_sim] input phase modulation per key
+        # Input plane perturbation: encoding (+ decoder) [B, F, N_sim, N_sim], F = 1 (constant, same encoding for all M
+        # keys) or M (split and / or per-key decoders); K > 0: opaque background, only encoding px pass
+        U_input = self.input_plane_field(a)
         U_input_exp = U_input.expand(-1, self.T, -1, -1) # [B, T, N_sim, N_sim]; F = 1 broadcasts, F = M is per frame
         U_flat = (U_at_enc_exp * U_input_exp).reshape(B * self.T, 1, self.N_sim, self.N_sim)
 
@@ -342,8 +425,7 @@ class TimeMultiplexedNFA(nn.Module):
         else:
             field = self.prop_to_layer1(U_flat)
             for k in range(self.num_layers):
-                layer_phase = self._get_layer_phase(k)
-                field = self.layer_aperture * torch.exp(1j * layer_phase) * field
+                field = self._layer_field(k) * field
                 if k < self.num_layers - 1:
                     field = self.prop_interlayer(field)
                 else:
@@ -351,6 +433,4 @@ class TimeMultiplexedNFA(nn.Module):
 
         I_ccd = U_ccd_flat.abs().pow(2)[:, 0].reshape(B, self.T, self.N_sim, self.N_sim)
         I_vec = self._integrate_photodiode_array(I_ccd)
-        if return_field:
-            return I_vec, I_ccd
-        return I_vec
+        return self._add_meas_noise(I_vec)              # no-op unless training with meas_noise_std > 0

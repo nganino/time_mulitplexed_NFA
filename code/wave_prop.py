@@ -1,5 +1,5 @@
 '''
-Single-Pixel QPI — wave propagation
+Time-Multiplexed NFA — wave propagation
 Angular Spectrum Method (ASM) free-space propagator.
 
 The transfer function H is pre-computed on the (optionally zero-padded)
@@ -27,24 +27,25 @@ class FreeSpaceProp(nn.Module):
     Input / output shape: [B, 1, N_sim, N_sim]  (complex64)
     '''
 
-    def __init__(self, config, z=None):
+    def __init__(self, config, z):
         super(FreeSpaceProp, self).__init__()
 
         self.N_sim      = config.N_sim
         self.pad_factor = int(getattr(config, 'asm_pad_factor', 1))
 
         wlength_eff = config.wavelength / config.ridx_air
-        dx = config.sim_dx          # simulation / SLM pixel pitch
-        z  = config.z_slm_ccd if z is None else z
+        dx = config.sim_dx          # simulation grid pitch
 
         # H is built on the zero-padded grid so that a single precomputed
         # buffer can be used in forward() without re-computing each call.
+        # Built in float64: the phase k*z*sqrt(...) reaches ~1e4 rad (lab 3 mm), where float32 rounding
+        # alone gives up to 3.5e-3 rad of phase error. Cast to complex64 only at the end.
         N_pad = self.N_sim * self.pad_factor
         dfx   = 1.0 / (N_pad * dx)
 
         fx, fy = torch.meshgrid(
-            (torch.arange(N_pad) - N_pad / 2) * dfx,
-            (torch.arange(N_pad) - N_pad / 2) * dfx,
+            (torch.arange(N_pad, dtype=torch.float64) - N_pad / 2) * dfx,
+            (torch.arange(N_pad, dtype=torch.float64) - N_pad / 2) * dfx,
             indexing='ij'
         )
 
@@ -59,11 +60,13 @@ class FreeSpaceProp(nn.Module):
             torch.clamp(1.0 - prop_arg, min=0.0)
         )
 
-        H = torch.complex(torch.cos(phase), torch.sin(phase)) * Q
+        H = torch.complex(torch.cos(phase), torch.sin(phase)) * Q   # complex128
         # Pre-shift DC to [0, 0] to match the output layout of fft2
-        H = torch.fft.ifftshift(H)[None, None]   # [1, 1, N_pad, N_pad]
+        H = torch.fft.ifftshift(H)[None, None].to(torch.complex64)   # [1, 1, N_pad, N_pad]
 
-        self.register_buffer('H', H)
+        # Not saved in checkpoints: H is fully determined by the config, and older checkpoints' stored
+        # (float32-built) H is ignored on load (strict=False), so every model uses this build.
+        self.register_buffer('H', H, persistent=False)
 
     def forward(self, u):
         '''

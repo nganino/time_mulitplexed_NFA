@@ -9,9 +9,10 @@ following Rahman et al., eLight (2025) 5:32, Sec. 4.1 / Eq. 10:
 where:
   - F_k(alpha_i) are complex Fourier coefficients, modulus ~ Uniform(0,1) and
     phase ~ Uniform(0, 2*pi) (PAPER, Eq. 10's surrounding text).
-  - alpha_i = (i-1) * encoding_freq_step for i = 1..Nalpha. Nalpha == Np in
-    encoding_mode='constant' (PAPER, Sec. 4.1: "We set Nalpha = Np and alpha_i = (i-1)"),
-    Nalpha == Np*M in encoding_mode='split' (see config.recompute_derived).
+  - alpha_i = (i - harmonic_shift) * encoding_freq_step for i = 0..Nalpha-1: centered, harmonic_shift =
+    Nalpha // 2 (centered_harmonics, default since 2026-10-20), or 0 = the PAPER's alpha_i = (i-1) form
+    (Sec. 4.1: "We set Nalpha = Np and alpha_i = (i-1)"). Both give identical |.|^2 targets. Nalpha == Np in
+    encoding_mode='constant', Nalpha == Np*M in encoding_mode='split' (see config.recompute_derived).
   - A single min-max normalization is applied JOINTLY across all Nf functions
     (not per-function) so the global min/max over (k, a) becomes 0/1 (PAPER,
     Sec. 4.1's normalization step, restated for Eq. 10's already-squared form).
@@ -42,8 +43,9 @@ class TargetFunctionSet:
         self.N_alpha  = int(config.N_alpha)   # number of harmonics (Np, or Np*M in split mode), see config.recompute_derived
         self.freq_step = float(getattr(config, 'encoding_freq_step', 1))
 
-        # alpha_i = (i-1) * freq_step, i = 1..N_alpha  (PAPER Sec. 4.1)
-        self.alphas = torch.arange(self.N_alpha, dtype=torch.float64) * self.freq_step
+        # alpha_i = (i - shift) * freq_step, i = 0..N_alpha-1: shift = N_alpha // 2 (centered, default) or 0 (PAPER Sec. 4.1
+        # form, runs before 2026-10-20). Coefficient i always pairs with harmonic i, so the two give identical |.|^2 targets.
+        self.alphas = (torch.arange(self.N_alpha, dtype=torch.float64) - int(getattr(config, 'harmonic_shift', 0))) * self.freq_step
 
         gen = torch.Generator().manual_seed(int(config.func_seed))
         modulus = torch.rand(self.Nf, self.N_alpha, generator=gen, dtype=torch.float64) # uniform distribution in [0, 1]
