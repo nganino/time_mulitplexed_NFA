@@ -1,0 +1,11 @@
+test1_F: PLUTO pattern rows 500..579 cols 920..999; LUNA window rows 406..673 cols 826..1093, checkerboard 0/128 elsewhere
+test2_pinhole: PLUTO pattern rows 446..633 cols 866..1053; LUNA window rows 535..544 cols 955..964, checkerboard 0/128 elsewhere
+LUNA lens f2 = 27.555 mm (max local freq 34.3/mm vs Nyquist 111/mm); PLUTO lens f1 = 33 mm (max 35.8/mm vs 62.5/mm)
+
+camera simulations (intensity in units of the incident beam), 2048 x 2048 px window = 12 mm
+  test1_F aligned (PLUTO shifted 0 um in x): max 0.0737, central 8.2 mm total power 0.844 mm^2 x incident; spectral propagator: P 22.25 mm, F1 83/mm (N1 2006), F2 90.1/mm (N2 2006), conv FFT 8064^2, key FFT 2781^2, LUNA FFT 4944^2, 4x4 nodes / detector
+  test1_F PLUTO_shift_x3px (PLUTO shifted 24 um in x): max 0.0745, central 8.2 mm total power 0.846 mm^2 x incident; spectral propagator: P 22.25 mm, F1 84/mm (N1 2006), F2 90.1/mm (N2 2006), conv FFT 8064^2, key FFT 2781^2, LUNA FFT 4944^2, 4x4 nodes / detector
+  test2_pinhole aligned (PLUTO shifted 0 um in x): max 0.0445, central 8.2 mm total power 1.351 mm^2 x incident; spectral propagator: P 21.67 mm, F1 74/mm (N1 1805), F2 83.3/mm (N2 1805), conv FFT 7290^2, key FFT 2709^2, LUNA FFT 4816^2, 4x4 nodes / detector
+  test2_pinhole PLUTO_shift_x4px (PLUTO shifted 32 um in x): max 0.0030, central 8.2 mm total power 0.045 mm^2 x incident; spectral propagator: P 21.74 mm, F1 76/mm (N1 1811), F2 83.3/mm (N2 1811), conv FFT 7290^2, key FFT 2718^2, LUNA FFT 4832^2, 4x4 nodes / detector
+test1_F camera BMPs: level = 255 x I / 0.0810 (linear)
+test2_pinhole camera BMPs: level = 255 x I / 0.0489 (linear)

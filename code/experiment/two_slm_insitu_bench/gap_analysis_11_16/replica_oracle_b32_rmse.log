@@ -1,0 +1,32 @@
+  step  -1  NMSE 0.5062  RMSE 5.0108e-02
+  step   4  NMSE 0.4571  RMSE 4.7202e-02  rms corr 0.088 rad
+  step   9  NMSE 0.4320  RMSE 4.5619e-02  rms corr 0.158 rad
+  step  14  NMSE 0.4188  RMSE 4.4648e-02  rms corr 0.211 rad
+  step  19  NMSE 0.4135  RMSE 4.4199e-02  rms corr 0.247 rad
+  step  24  NMSE 0.4114  RMSE 4.3995e-02  rms corr 0.271 rad
+  step  29  NMSE 0.4096  RMSE 4.3867e-02  rms corr 0.286 rad
+  step  34  NMSE 0.4097  RMSE 4.3843e-02  rms corr 0.295 rad
+  step  39  NMSE 0.4090  RMSE 4.3797e-02  rms corr 0.300 rad
+  step  44  NMSE 0.4085  RMSE 4.3748e-02  rms corr 0.304 rad
+  step  49  NMSE 0.4077  RMSE 4.3673e-02  rms corr 0.309 rad
+  step  54  NMSE 0.4078  RMSE 4.3637e-02  rms corr 0.312 rad
+  step  59  NMSE 0.4080  RMSE 4.3627e-02  rms corr 0.316 rad
+  step  64  NMSE 0.4076  RMSE 4.3614e-02  rms corr 0.319 rad
+  step  69  NMSE 0.4079  RMSE 4.3598e-02  rms corr 0.322 rad
+  step  74  NMSE 0.4087  RMSE 4.3611e-02  rms corr 0.323 rad
+  step  79  NMSE 0.4078  RMSE 4.3597e-02  rms corr 0.325 rad
+  step  84  NMSE 0.4073  RMSE 4.3559e-02  rms corr 0.327 rad
+  step  89  NMSE 0.4075  RMSE 4.3569e-02  rms corr 0.328 rad
+  step  94  NMSE 0.4079  RMSE 4.3589e-02  rms corr 0.328 rad
+  step  99  NMSE 0.4078  RMSE 4.3568e-02  rms corr 0.328 rad
+  step 104  NMSE 0.4081  RMSE 4.3588e-02  rms corr 0.328 rad
+  step 109  NMSE 0.4082  RMSE 4.3623e-02  rms corr 0.329 rad
+  step 114  NMSE 0.4082  RMSE 4.3578e-02  rms corr 0.330 rad
+  step 119  NMSE 0.4087  RMSE 4.3595e-02  rms corr 0.330 rad
+  step 124  NMSE 0.4084  RMSE 4.3574e-02  rms corr 0.331 rad
+  step 129  NMSE 0.4079  RMSE 4.3563e-02  rms corr 0.331 rad
+  step 134  NMSE 0.4080  RMSE 4.3552e-02  rms corr 0.331 rad
+  step 139  NMSE 0.4080  RMSE 4.3552e-02  rms corr 0.331 rad
+  step 144  NMSE 0.4080  RMSE 4.3562e-02  rms corr 0.331 rad
+  step 149  NMSE 0.4077  RMSE 4.3559e-02  rms corr 0.331 rad
+done in 826 s

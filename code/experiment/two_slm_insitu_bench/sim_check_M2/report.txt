@@ -1,0 +1,29 @@
+checkpoint ckpt_M2\bench_M2_bin1_ep4.pth (epoch 4): M 2, z1 35.87 mm, z2 175.35 mm, key 414 px of 8.075 um, decoder 736 LUNA px of 4.5 um, bin 110, detectors 4 px on a 8 px pitch
+spectral propagator: P 10.17 mm, F1 209/mm (N1 2128), F2 47.3/mm (N2 482), conv FFT 5250^2, key FFT 1260^2, LUNA FFT 2261^2, 4x4 nodes / detector
+frame check key 0: package pluto_frame vs model levels: 1 px differ, max 1 level
+frame check decoder 0, a -0.500: package luna_frame vs model levels: 4 px differ, max 1 level
+frame check decoder 0, a +0.500: package luna_frame vs model levels: 4 px differ, max 1 level
+frame check key 1: package pluto_frame vs model levels: 1 px differ, max 1 level
+frame check decoder 1, a -0.500: package luna_frame vs model levels: 2 px differ, max 1 level
+frame check decoder 1, a +0.500: package luna_frame vs model levels: 4 px differ, max 1 level
+slm_bmp/: what the package sends for each frame m (key centre (528, 990) model frame, conjugate, phase table, PLUTO rot 180; no collimator lens). Frame m = pluto_key<m> together with luna_dec<m>.
+zero-shot expected (linear phases), 100 a: min-max RMSE 1.052e-03, affine (reward) RMSE 5.000e-04
+zero-shot expected (table  phases), 100 a: min-max RMSE 2.347e-02, affine (reward) RMSE 9.065e-03
+sensitivity (linear phases, affine = reward RMSE; trained value 5.000e-04):
+  z1 -0.5 mm            : min-max 9.985e-02, affine 5.539e-02
+  z1 +0.5 mm            : min-max 1.033e-01, affine 5.532e-02
+  z2 -0.5 mm            : min-max 6.071e-02, affine 2.586e-02
+  z2 +0.5 mm            : min-max 5.479e-02, affine 2.589e-02
+  key -3 px x           : min-max 1.568e-01, affine 8.728e-02
+  key +3 px x           : min-max 1.555e-01, affine 8.725e-02
+  key -3 px y           : min-max 1.284e-01, affine 8.723e-02
+  key +3 px y           : min-max 1.485e-01, affine 8.717e-02
+  m -0.005 (1.00463)    : min-max 1.118e-01, affine 5.573e-02
+  m +0.005 (1.01475)    : min-max 1.134e-01, affine 5.999e-02
+
+camera images (phases through the phase table = what the package produces): raw orientation, 1200 x 1920, axis at raw corner (497, 985), cam flips (True, True)
+  a -0.500: mean 0.907, max 2.607  (29 s)
+  a +0.005: mean 0.907, max 2.638  (21 s)
+  a +0.500: mean 0.907, max 2.607  (21 s)
+whole sensor max 2.64; inside the detector array: px max 1.26, 99.9th percentile 0.83 -> expose for the array; BMPs: make_cmos_bmps.py
+end-to-end: package captures_to_detectors on the raw sim images vs model detectors, 3 a: RMS diff 1.2e-06 of the readout range, max 7.0e-06

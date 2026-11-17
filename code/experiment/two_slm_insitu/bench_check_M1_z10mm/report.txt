@@ -1,0 +1,20 @@
+checkpoint z2_10mm_M1_8bit.pth: M 1, z1 3 mm, z2 10 mm, bits 8, key 120 PLUTO px, decoder 213 LUNA px, bin 28
+design distances, 64 x 64 detectors, 100 a: min-max RMSE asm (as trained) 5.95e-03, spectral 6.09e-03; spectral vs asm readout 2.4e-03 of range
+geometry: key corner -480.00 / -480.00 um (120 px), LUNA array corner -477.00 / -477.00 um (213 x 213 px)
+luna_M1_a-0.50.bmp: levels 0..255, model vs in-situ luna_frame build: 1 px differ
+luna_M1_a-0.25.bmp: levels 0..255, model vs in-situ luna_frame build: 1 px differ
+luna_M1_a+0.00.bmp: levels 0..255, model vs in-situ luna_frame build: 1 px differ
+luna_M1_a+0.25.bmp: levels 0..255, model vs in-situ luna_frame build: 1 px differ
+luna_M1_a+0.50.bmp: levels 0..255, model vs in-situ luna_frame build: 1 px differ
+pluto_key_M1.bmp: key rows/cols 480..599 / 900..1019; LUNA decoder rows/cols 434..646 / 854..1066 (encoding block 456..623 / 876..1043)
+
+camera simulations (units: incident beam intensity; 1 = unmodulated beam)
+  camera z1 3 mm / z2 10 mm, 256 x 256 px (1.50 mm): spectral propagator: P 4.61 mm, F1 723/mm (N1 3330), F2 292.6/mm (N2 1349), conv FFT 9375^2, key FFT 576^2, LUNA FFT 1024^2, 4x4 nodes / detector
+  camera z1 33 mm / z2 167 mm, 2048 x 2048 px (12.00 mm): spectral propagator: P 22.25 mm, F1 85/mm (N1 1974), F2 88.7/mm (N2 1974), conv FFT 7938^2, key FFT 2781^2, LUNA FFT 4944^2, 4x4 nodes / detector
+  a -0.50: locked full window mean 0.995 max 1.72; central 1.5 mm mean 0.487 max 1.52; design-distance central 1.5 mm mean 0.757 max 3.96
+  a -0.25: locked full window mean 0.995 max 1.69; central 1.5 mm mean 0.486 max 1.46; design-distance central 1.5 mm mean 0.756 max 3.74
+  a +0.00: locked full window mean 0.995 max 1.63; central 1.5 mm mean 0.489 max 1.57; design-distance central 1.5 mm mean 0.758 max 3.74
+  a +0.25: locked full window mean 0.995 max 1.70; central 1.5 mm mean 0.486 max 1.57; design-distance central 1.5 mm mean 0.757 max 3.15
+  a +0.50: locked full window mean 0.995 max 1.72; central 1.5 mm mean 0.487 max 1.52; design-distance central 1.5 mm mean 0.757 max 3.96
+
+locked distances, trained 64 x 64 detector grid, 100 a: min-max RMSE 2.04e-01 (design 6.09e-03) -- these masks are not expected to compute the functions at 33 / 167 mm

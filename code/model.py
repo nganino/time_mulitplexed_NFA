@@ -27,7 +27,7 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
-from wave_prop import FreeSpaceProp
+from wave_prop import FreeSpaceProp, SpectralLabProp
 from config import encoding_tile_cells, footprint
 
 # --------------------------------------------------------------------------- #
@@ -99,6 +99,24 @@ class TimeMultiplexedNFA(nn.Module):
         self.phase_slm_noise_std = float(getattr(config, 'phase_slm_noise_std', 0.0))   # rad; absent in pre-10-29 configs
         bd = getattr(config, 'slm_phase_bits', 'inf')       # 'inf' = continuous SLM phase, int b = 2^b levels
         self.slm_levels = None if bd == 'inf' else 2 ** int(bd)
+        # Measured phase vs grey level (2026-11-11, config.slm_phase_table): level k of an SLM realises
+        # sign * table[k] (mod 2 pi) instead of 2 pi k / 2^b; sign -1 = the bench's conjugate drive (TRAINING_ADJUSTMENTS
+        # 2026-11-11). Keys use the 'pluto' table, the encoding plane (encoding + decoder) and any layers the 'luna' one.
+        # pset_<slm>: the realisable phases, sorted in [0, 2 pi), padded by one wrapped value at each end (for _quantize)
+        self.phase_table = getattr(config, 'slm_phase_table', None) or None
+        if self.phase_table:
+            import json
+            assert self.slm_levels is not None, 'slm_phase_table needs an integer slm_phase_bits'
+            path = self.phase_table if os.path.isabs(self.phase_table) else \
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), self.phase_table)
+            tab = json.load(open(path))
+            sign = float(getattr(config, 'slm_phase_table_sign', -1))
+            for slm in ('pluto', 'luna'):
+                t = np.asarray(tab[slm], dtype=np.float64)
+                assert len(t) == self.slm_levels, f'{slm} table has {len(t)} levels, slm_phase_bits gives {self.slm_levels}'
+                s = np.unique(np.mod(sign * t, 2 * np.pi))
+                ext = np.concatenate([[s[-1] - 2 * np.pi], s, [s[0] + 2 * np.pi]])
+                self.register_buffer(f'pset_{slm}', torch.from_numpy(ext).float(), persistent=False)
 
         # Phase-key geometry: key SLM pixels (key_slm_dx = key_ratio sim px each)
         self.phase_key_size     = config.phase_key_size # key SLM px per side
@@ -185,8 +203,20 @@ class TimeMultiplexedNFA(nn.Module):
         hw_y, hw_x = int(getattr(config, 'slm_hw_y', self.phase_key_size)), int(getattr(config, 'slm_hw_x', self.phase_key_size))
         ap_y = _AxisRaster(hw_y, self.key_ratio, centred(hw_y, self.key_ratio), N)
         ap_x = _AxisRaster(hw_x, self.key_ratio, centred(hw_x, self.key_ratio), N)
-        self.register_buffer('slm_aperture', (ap_y.coverage[:, None] * ap_x.coverage[None, :])[None, None],
-                             persistent=False)
+        ap = ap_y.coverage[:, None] * ap_x.coverage[None, :]
+        # illum_taper = f > 0 (lab since 2026-10-30): the illuminated SLM is larger than the grid, so the grid edge would
+        # be a hard-edged beam edge whose diffraction reaches the camera (11 % readout error at a 2x-key grid); a cosine
+        # (Tukey) taper over the outer f / 2 of the grid on each side models a wide smooth beam instead
+        # (0.34 % vs the converged estimate, logs/grid_study_2026-10-30/grid_study3*)
+        f = float(getattr(config, 'illum_taper', 0.0) or 0.0)
+        if f > 0:
+            x = torch.arange(N, dtype=torch.float64) + 0.5
+            e = f * N / 2
+            t = torch.ones(N, dtype=torch.float64)
+            t[x < e] = 0.5 * (1 - torch.cos(np.pi * x[x < e] / e))
+            t[x > N - e] = 0.5 * (1 - torch.cos(np.pi * (N - x[x > N - e]) / e))
+            ap = ap * (t[:, None] * t[None, :]).to(ap.dtype)
+        self.register_buffer('slm_aperture', ap[None, None], persistent=False)
         self.register_buffer('key_coverage', outer(self.ras_key), persistent=False)
 
         # Encoding SLM: one pixel array holds the encoding patch (+ tile copies, all in encoding-SLM px) and the decoder.
@@ -195,6 +225,9 @@ class TimeMultiplexedNFA(nn.Module):
         s = int(config.encoding_patch_scale); G = s * self.encoding_gap_blocks      # SLM px per encoding px / per gap
         ph, pw = int(config.encoding_y_num_px), int(config.encoding_x_num_px)       # one patch copy, SLM px
         shifts = [(r * (ph + G), c * (pw + G)) for r, c in encoding_tile_cells(self.encoding_tile_pattern)]
+        assert all(float(v).is_integer() for d in shifts for v in d), \
+            'even tile grids (half-patch offsets) need an even patch size in SLM px'
+        shifts = [(int(dy), int(dx)) for dy, dx in shifts]
         self.encoding_tile_shifts = [(round(dy * self.enc_ratio), round(dx * self.enc_ratio)) for dy, dx in shifts]   # sim px (figures)
         enc0 = ((N - footprint(ph, self.enc_ratio)) // 2, (N - footprint(pw, self.enc_ratio)) // 2)
         lo = [min(d[i] for d in shifts) for i in (0, 1)]                # array bounds, SLM px from the patch origin
@@ -254,6 +287,40 @@ class TimeMultiplexedNFA(nn.Module):
         else:
             self.background_amp = None
 
+        # 2026-11-10: prop_method 'spectral' (K = 0 E+D, transparent background): per-plane spectral propagator
+        # (wave_prop.SpectralLabProp) in place of the sim-grid ASM; the sim grid is then only used for figures
+        self.prop_method = getattr(config, 'prop_method', 'asm')
+        if self.prop_method == 'spectral':
+            assert self.num_layers == 0 and not self.opaque_background and self.decoder, \
+                "prop_method 'spectral' supports only the K = 0 E+D model with a transparent background"
+            dx, ks = self.sim_dx, centred(self.phase_key_size, self.key_ratio)
+            n = np.arange(self.pd_num_rows)
+            geom = dict(p1=config.key_slm_dx, nk=self.phase_key_size,
+                        key_y0=(ks - N / 2) * dx, key_x0=(ks - N / 2) * dx,
+                        p2=config.enc_slm_dx, luna_ny=ny, luna_nx=nx,
+                        luna_y0=(enc0[0] + lo[0] * self.enc_ratio - N / 2) * dx,
+                        luna_x0=(enc0[1] + lo[1] * self.enc_ratio - N / 2) * dx,
+                        det_cy=(n - (self.pd_num_rows - 1) / 2) * config.det_pitch_m + self.det_offset_y * dx,
+                        det_cx=(np.arange(self.pd_num_cols) - (self.pd_num_cols - 1) / 2) * config.det_pitch_m
+                               + self.det_offset_x * dx,
+                        det_size=config.det_size_m, z1=config.key_to_enc_spacing, z2=config.last_layer_ccd_spacing)
+            adj = {k.strip(): float(v) for k, v in (kv.split('=') for kv in str(getattr(config, 'spec_adjust', '') or '').split(',') if kv.strip())}
+            if adj:   # 2026-11-16: fitted bench geometry (config.spec_adjust)
+                bad = set(adj) - {'key_dy', 'key_dx', 'luna_dy', 'luna_dx', 'det_dy', 'det_dx', 'cam_mag'}
+                assert not bad, f'unknown spec_adjust keys {bad}'
+                cm, cdx = 1 + adj.get('cam_mag', 0.0), config.camera_dx
+                geom.update(key_y0=geom['key_y0'] + adj.get('key_dy', 0.0) * geom['p1'],
+                            key_x0=geom['key_x0'] + adj.get('key_dx', 0.0) * geom['p1'],
+                            luna_y0=geom['luna_y0'] + adj.get('luna_dy', 0.0) * geom['p2'],
+                            luna_x0=geom['luna_x0'] + adj.get('luna_dx', 0.0) * geom['p2'],
+                            det_cy=np.asarray(geom['det_cy']) * cm + adj.get('det_dy', 0.0) * cdx,
+                            det_cx=np.asarray(geom['det_cx']) * cm + adj.get('det_dx', 0.0) * cdx,
+                            det_size=geom['det_size'] * cm)
+            self.luna_fringe = float(getattr(config, 'luna_fringe', 0.0) or 0.0)
+            self.spec_geom = geom
+            self.spec = SpectralLabProp(config, geom)
+            return
+
         # Free-space propagators
         self.prop_key_to_enc = FreeSpaceProp(config, z=config.key_to_enc_spacing)
         self.key_to_enc_exact = (float(config.key_to_enc_spacing) == 0.0
@@ -277,20 +344,30 @@ class TimeMultiplexedNFA(nn.Module):
         pad_right  = pad_w - pad_left
         return F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
 
-    def _quantize(self, phi):
+    def _quantize(self, phi, slm='luna'):
         # SLM bit depth: wrap to [0, 2pi) and round to slm_levels equally spaced levels. Straight-through estimator:
         # the forward pass sees the quantised phase, the gradient passes as if continuous. No rounding when slm_levels is None.
+        # With a measured phase table (slm_phase_table): round to the nearest (on the circle) phase that SLM `slm`
+        # ('pluto' keys, 'luna' encoding plane / layers) can realise instead; phases in its unreachable band snap to the
+        # nearer end. Same straight-through gradient.
         # Training only (phase_slm_noise_std > 0): fresh Gaussian phase noise (rad) on every displayed SLM px, after the
         # rounding, at any bit depth; val / test / figures see the noiseless phase.
         noise = torch.randn_like(phi) * self.phase_slm_noise_std if self.training and self.phase_slm_noise_std > 0 else 0.0
         if self.slm_levels is None:
             return phi + noise
+        if self.phase_table:
+            ext = getattr(self, f'pset_{slm}')
+            x = torch.remainder(phi.detach(), 2 * np.pi).float().contiguous()
+            i = torch.searchsorted(ext, x).clamp(1, len(ext) - 1)
+            lo, hi = ext[i - 1], ext[i]
+            q = torch.remainder(torch.where(x - lo <= hi - x, lo, hi), 2 * np.pi).to(phi.dtype)
+            return phi + (q - phi).detach() + noise
         step = 2 * np.pi / self.slm_levels
         q = torch.remainder(torch.round(torch.remainder(phi, 2 * np.pi) / step), self.slm_levels) * step
         return phi + (q - phi).detach() + noise
 
     def key_phases(self):
-        return self._quantize(torch.sigmoid(self.slm_phases) * (2 * np.pi))
+        return self._quantize(torch.sigmoid(self.slm_phases) * (2 * np.pi), 'pluto')
 
     def _get_slm_field(self):
         # key phases on the sim grid [M, 1, N_sim, N_sim] (figures; 0 outside the key, area-mixed at pixel edges)
@@ -360,6 +437,16 @@ class TimeMultiplexedNFA(nn.Module):
             phi = phi + self.decoder_phases_px()
         return self._quantize(phi)              # the SLM displays encoding + decoder as one quantised pattern
 
+    def _fringe(self, phi):
+        # 2026-11-16: LUNA pixel crosstalk (config.luna_fringe w; spectral path only): each displayed phase becomes
+        # (1 - 4w) itself + w each of its 4 neighbours (edge pixels replicate). Identity when w = 0.
+        w = getattr(self, 'luna_fringe', 0.0)
+        if not w:
+            return phi
+        k = phi.new_tensor([[0, w, 0], [w, 1 - 4 * w, w], [0, w, 0]])
+        sh = phi.shape
+        return F.conv2d(F.pad(phi.reshape(-1, 1, *sh[-2:]), (1, 1, 1, 1), mode='replicate'), k[None, None]).reshape(sh)
+
     def input_plane_field(self, a):
         # Encoding-plane modulation on the sim grid [B, F, N_sim, N_sim]. K > 0: opaque background, only the encoding
         # pixels pass light; K = 0: transparent (unit field off the encoding SLM's pixel array)
@@ -408,6 +495,12 @@ class TimeMultiplexedNFA(nn.Module):
         mode, Gaussian detector noise is added (_add_meas_noise).
         '''
         B = a.shape[0]
+        if self.prop_method == 'spectral':
+            # keys and LUNA on their own pixels (e^{i phi} - 1: the flat surroundings are the analytic plane wave)
+            V1, v1s = self.spec.key_field_L(torch.exp(1j * self.key_phases()[:, 0]) - 1)          # [T, L, L] each
+            d = torch.exp(1j * self._fringe(self._input_plane_px(a))) - 1                         # [B, F, ny, nx]
+            I_vec = self.spec(V1, v1s, d.expand(-1, self.T, -1, -1))
+            return self._add_meas_noise(I_vec)
         # Phase-key plane -> input plane
         U_key        = self._key_field() # [T, 1, N_sim, N_sim]
         U_at_enc     = self._key_to_encoding(U_key) # [T, 1, N_sim, N_sim] either propagated or copied (z=0) to the input plane

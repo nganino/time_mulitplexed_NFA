@@ -1,0 +1,21 @@
+checkpoint ckpt_M2\bench_M2_bin1_ep4.pth (epoch 4): M 2, trained z1 35.87 / z2 175.35 mm, key 414, decoder 736, bin 110
+100-a RMSE vs z2 (min-max / affine = reward):
+  z2 175.35 mm, linear phases: min-max 1.052e-03, affine 5.000e-04
+  z2 175.35 mm, table  phases: min-max 2.347e-02, affine 9.065e-03
+  z2 175.85 mm, linear phases: min-max 5.479e-02, affine 2.589e-02
+  z2 175.85 mm, table  phases: min-max 5.548e-02, affine 2.650e-02
+
+camera images (table phases), raw orientation, axis (497, 985), flips (True, True):
+  z2 175.35 mm, a -0.500: sensor mean 0.907, array mean 0.2073, array max 1.260  (21 s)
+  z2 175.35 mm, a -0.247: sensor mean 0.907, array mean 0.2066, array max 1.109  (21 s)
+  z2 175.35 mm, a +0.005: sensor mean 0.907, array mean 0.2082, array max 1.225  (21 s)
+  z2 175.35 mm, a +0.258: sensor mean 0.907, array mean 0.2070, array max 1.510  (21 s)
+  z2 175.85 mm, a -0.500: sensor mean 0.907, array mean 0.2066, array max 1.265  (21 s)
+  z2 175.85 mm, a -0.247: sensor mean 0.907, array mean 0.2059, array max 1.098  (21 s)
+  z2 175.85 mm, a +0.005: sensor mean 0.907, array mean 0.2075, array max 1.206  (21 s)
+  z2 175.85 mm, a +0.258: sensor mean 0.907, array mean 0.2063, array max 1.511  (21 s)
+  a -0.500: correlation 175.35 vs 175.85 mm: detector readings 0.957, array pixels 0.964
+  a -0.247: correlation 175.35 vs 175.85 mm: detector readings 0.957, array pixels 0.965
+  a +0.005: correlation 175.35 vs 175.85 mm: detector readings 0.957, array pixels 0.964
+  a +0.258: correlation 175.35 vs 175.85 mm: detector readings 0.961, array pixels 0.965
+done

@@ -55,11 +55,25 @@ class FunctionApproxLoss(nn.Module):
         self.train_readout = getattr(config, 'train_readout', 'affine')   # or 'minmax' (per-batch min-max, see below)
         # or 'globalminmax': the test's global min-max, with Pmin / Pmax measured on the full a-grid at the start of every
         # epoch (train.py sets train_p_range) and held fixed as constants during the epoch, against the global targets
-        assert self.train_readout in ('minmax', 'affine', 'globalminmax'), f'unknown train_readout {self.train_readout!r}'
+        # or 'perfuncminmax' (2026-11-13, matches the bench's per-function readout): every function k min-max'd over the
+        # batch's a values, f_hat_k = (I_k - min_a I_k) / (max_a I_k - min_a I_k), targets the same; validation in
+        # train.py then also uses per-function min-max over the a-grid (test.py stays global)
+        # or 'perfuncaffine' (2026-11-14): a learned scale + offset PER FUNCTION (Nf each, training only) against targets
+        # min-max'd per function on the 2001-point calibration grid; independent of the micro-batch size (perfuncminmax
+        # gets min == max at micro-batch 1). Val per-function min-max, as perfuncminmax.
+        assert self.train_readout in ('minmax', 'affine', 'globalminmax', 'perfuncminmax', 'perfuncaffine'), \
+            f'unknown train_readout {self.train_readout!r}'
+        self.per_function = self.train_readout in ('perfuncminmax', 'perfuncaffine')
         self.train_p_range = None
-        if self.train_readout == 'affine':
-            self._raw_scale = nn.Parameter(torch.tensor(0.5413))      # softplus(0.5413) = 1
-            self.bias = nn.Parameter(torch.zeros(()))
+        if self.train_readout in ('affine', 'perfuncaffine'):
+            shape = (self.Nf,) if self.train_readout == 'perfuncaffine' else ()
+            self._raw_scale = nn.Parameter(torch.full(shape, 0.5413))  # softplus(0.5413) = 1
+            self.bias = nn.Parameter(torch.zeros(shape))
+        if self.train_readout == 'perfuncaffine':
+            from target_functions import TargetFunctionSet
+            t = TargetFunctionSet(config)(torch.linspace(config.a_min, config.a_max, 2001))   # [2001, Nf], global-normalised
+            self.register_buffer('t_min', t.amin(0), persistent=False)
+            self.register_buffer('t_max', t.amax(0), persistent=False)
 
     def _detector_to_function(self, I_vec):
         '''
@@ -71,8 +85,10 @@ class FunctionApproxLoss(nn.Module):
         return I_integrated.reshape(B, self.Nf)   # [B, Nf], k = r * cols + c
 
     @staticmethod
-    def minmax_range(I):
-        '''(Pmin, Pmax) over every entry of I (all samples a and all detectors k).'''
+    def minmax_range(I, per_function=False):
+        '''(Pmin, Pmax) over every entry of I (all samples a and all detectors k); per_function: [1, Nf] each, over a only.'''
+        if per_function:
+            return I.amin(0, keepdim=True), I.amax(0, keepdim=True)
         return I.min(), I.max()
 
     @staticmethod
@@ -94,11 +110,16 @@ class FunctionApproxLoss(nn.Module):
         f_hat : [B, Nf]  normalized model output (for logging/plotting)
         '''
         I = self._detector_to_function(I_vec)                    # [B, Nf]
-        if p_range is None and self.train_readout == 'affine':
+        if p_range is None and self.train_readout in ('affine', 'perfuncaffine'):
             f_hat = I * torch.nn.functional.softplus(self._raw_scale) + self.bias   # training-only learned readout
+            if self.train_readout == 'perfuncaffine':
+                target = self.normalize(target, self.t_min, self.t_max)            # per-function [0, 1]
         elif p_range is None and self.train_readout == 'globalminmax':
             assert self.train_p_range is not None, 'globalminmax: train.py must set train_p_range each epoch'
             f_hat = self.normalize(I, *self.train_p_range)          # constants from the epoch's full-grid calibration
+        elif p_range is None and self.per_function:
+            f_hat = self.normalize(I, *self.minmax_range(I, True))          # per function, over the batch's a values
+            target = self.normalize(target, *self.minmax_range(target, True))
         elif p_range is None:
             # Training: a batch rarely holds the targets' global extremes (Np64 Nf1024: batch-64 target max ~0.84), so
             # normalising only f_hat by the batch's own Pmin / Pmax would demand a batch-dependent rescaling. Normalise the

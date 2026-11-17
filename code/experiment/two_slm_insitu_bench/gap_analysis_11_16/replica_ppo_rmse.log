@@ -1,0 +1,18 @@
+noise: relative detector std 0.0874 (6-a NMSE reward std vs s: {0.01: 0.0003286527387040848, 0.02: 0.0008165569345796835, 0.04: 0.0011466005962863285, 0.08: 0.0022402362502499024, 0.16: 0.0038326862835288984})
+  ep  -1  NMSE 0.5062  RMSE 5.0108e-02
+  ep   4  NMSE 0.5008  RMSE 4.9810e-02  rms corr 0.052 rad
+  ep   9  NMSE 0.4964  RMSE 4.9500e-02  rms corr 0.070 rad
+  ep  14  NMSE 0.4914  RMSE 4.9174e-02  rms corr 0.084 rad
+  ep  19  NMSE 0.4852  RMSE 4.8823e-02  rms corr 0.096 rad
+  ep  24  NMSE 0.4811  RMSE 4.8533e-02  rms corr 0.106 rad
+  ep  29  NMSE 0.4767  RMSE 4.8211e-02  rms corr 0.117 rad
+  ep  34  NMSE 0.4719  RMSE 4.7876e-02  rms corr 0.126 rad
+  ep  39  NMSE 0.4688  RMSE 4.7657e-02  rms corr 0.133 rad
+  ep  44  NMSE 0.4661  RMSE 4.7505e-02  rms corr 0.140 rad
+  ep  49  NMSE 0.4634  RMSE 4.7317e-02  rms corr 0.149 rad
+  ep  54  NMSE 0.4605  RMSE 4.7109e-02  rms corr 0.156 rad
+  ep  59  NMSE 0.4570  RMSE 4.6894e-02  rms corr 0.165 rad
+  ep  64  NMSE 0.4531  RMSE 4.6672e-02  rms corr 0.171 rad
+  ep  69  NMSE 0.4510  RMSE 4.6525e-02  rms corr 0.176 rad
+  ep  74  NMSE 0.4499  RMSE 4.6425e-02  rms corr 0.182 rad
+done in 9003 s

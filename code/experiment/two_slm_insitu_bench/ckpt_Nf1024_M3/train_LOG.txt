@@ -1,0 +1,32 @@
+Design values ([set] = from --set, [derived] = from formula):
+  device profile = lab: key SLM 8.07 um (16.15 sim px), encoding SLM 4.5 um (9 sim px), sim 0.5 um, camera 5.86 um (12 sim px), N_sim 6720 (3.36 mm), gaps 35.9, 175 mm
+  N_trainable_features = 10240 [derived]  (formula: ceil(r*2*N_alpha*Nf), r=1.25, N_alpha=4, Nf=1024)
+  layer_size     = 0  (K = 0: no diffractive layers, only the phase keys train)
+  phase_key_size = 414 [set]  (formula: detector array / key_det_fill 0.9) -> 6687 sim px
+  detectors      = 32 x 32  (formula: sqrt(Nf)); size 144 px, pitch 192 x 192 px
+  encoding mode  = constant: Np = 4 px per frame, N_alpha = 4 harmonics; displayed alpha = 0 .. 3 (targets centered); background transparent (background_opaque auto)
+  encoding       = 2 x 2 px (rows x cols), 110 SLM px each, gap 0 -> 220 x 220 SLM px = 1980 x 1980 sim px
+  encoding tiles = full -> extent 5940 sim px
+  SLM phase      = 8-bit: 256 levels, step 2pi/256 (straight-through gradient)
+  readout        = val / test: f_hat = (I - Pmin) / (Pmax - Pmin), Pmin / Pmax over all detectors and the a-grid; training loss: learned scale * I + offset, discarded after training (train_readout affine)
+  decoder (E+D)  =736 x 736 SLM px (set) -> 6624 sim px, one per frame (M = 3), trainable on every pixel (incl. encoding pixels), phase init 0
+<epoch:  0> loss_train:6.374e-04
+<epoch:  0> loss_val:3.559e-07  rmse_mean:5.937e-04  rmse_max:7.426e-04  diff_eff:1.366e-01
+<epoch:  1> loss_train:1.755e-08
+<epoch:  1> loss_val:4.246e-08  rmse_mean:2.042e-04  rmse_max:3.028e-04  diff_eff:1.366e-01
+<epoch:  2> loss_train:1.443e-08
+<epoch:  2> loss_val:7.632e-08  rmse_mean:2.738e-04  rmse_max:5.230e-04  diff_eff:1.366e-01
+<epoch:  3> loss_train:1.840e-08
+<epoch:  3> loss_val:1.168e-07  rmse_mean:3.381e-04  rmse_max:5.713e-04  diff_eff:1.366e-01
+<epoch:  4> loss_train:2.626e-08
+<epoch:  4> loss_val:9.536e-08  rmse_mean:3.044e-04  rmse_max:6.226e-04  diff_eff:1.366e-01
+<epoch:  5> loss_train:1.361e-07
+<epoch:  5> loss_val:1.700e-07  rmse_mean:4.057e-04  rmse_max:9.488e-04  diff_eff:1.367e-01
+<epoch:  6> loss_train:1.889e-07
+<epoch:  6> loss_val:3.618e-07  rmse_mean:5.926e-04  rmse_max:1.653e-03  diff_eff:1.367e-01
+<epoch:  7> loss_train:2.321e-07
+<epoch:  7> loss_val:6.698e-07  rmse_mean:8.070e-04  rmse_max:2.217e-03  diff_eff:1.368e-01
+<epoch:  8> loss_train:3.126e-07
+<epoch:  8> loss_val:1.030e-06  rmse_mean:9.991e-04  rmse_max:3.407e-03  diff_eff:1.369e-01
+<epoch:  9> loss_train:3.719e-07
+<epoch:  9> loss_val:1.557e-06  rmse_mean:1.232e-03  rmse_max:3.214e-03  diff_eff:1.371e-01

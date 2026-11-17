@@ -96,18 +96,18 @@ class TimeMultiplexedNFATrainer:
         self.criterion = FunctionApproxLoss(config).to(self.device)   # min-max readout (+ training-only affine)
         (self.opt_slm, self.opt_layers,
          self.sched_slm, self.sched_layers) = self._init_optimizers()
-        # Training-only learned readout (train_readout 'affine'): its scale / offset use lr_slm and its cosine schedule
+        # Training-only learned readout (train_readout 'affine'): its scale / offset use lr_readout (None -> lr_slm)
+        # and a cosine schedule
         self.opt_readout = self.sched_readout = None
         if list(self.criterion.parameters()):
-            self.opt_readout = torch.optim.Adam(self.criterion.parameters(), lr=config.lr_slm, betas=(0.9, 0.999))
-            self.sched_readout = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.opt_readout, T_max=config.max_epoch, eta_min=config.lr_slm * config.lr_min_ratio)
+            lr_ro = getattr(config, 'lr_readout', None) or config.lr_slm
+            self.opt_readout = torch.optim.Adam(self.criterion.parameters(), lr=lr_ro, betas=(0.9, 0.999))
+            self.sched_readout = self._cosine(self.opt_readout, lr_ro)
         # Decoder (E+D, model.py): own Adam + cosine schedule, only when config.decoder is on
         self.opt_decoder = self.sched_decoder = None
         if self.model.decoder:
             self.opt_decoder = torch.optim.Adam([self.model.decoder_phases], lr=config.lr_decoder, betas=(0.9, 0.999))
-            self.sched_decoder = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.opt_decoder, T_max=config.max_epoch, eta_min=config.lr_decoder * config.lr_min_ratio)
+            self.sched_decoder = self._cosine(self.opt_decoder, config.lr_decoder)
 
         if config.ckpt_to_load is not None:
             print(f'Loading checkpoint: {config.ckpt_to_load}')
@@ -131,6 +131,18 @@ class TimeMultiplexedNFATrainer:
                   f' ({"one per key" if model.decoder_per_key else "shared by all keys"})')
         return model
 
+    def _cosine(self, opt, lr):
+        '''Cosine schedule lr -> lr * lr_min_ratio over max_epoch (stepped once per epoch). lr_warmup_epochs W > 0
+        (2026-11-11): linear warm-up first, factor (e + 1) / (W + 1) at epochs e < W, then the cosine from lr over the
+        remaining max_epoch - W epochs. W = 0 keeps the original CosineAnnealingLR exactly.'''
+        c = self.config
+        W = int(getattr(c, 'lr_warmup_epochs', 0) or 0)
+        if W <= 0:
+            return torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c.max_epoch, eta_min=lr * c.lr_min_ratio)
+        r, Tc = c.lr_min_ratio, max(c.max_epoch - W, 1)
+        f = lambda e: (e + 1) / (W + 1) if e < W else r + (1 - r) * 0.5 * (1 + np.cos(np.pi * min(e - W, Tc) / Tc))
+        return torch.optim.lr_scheduler.LambdaLR(opt, f)
+
     def _init_optimizers(self):
         freeze_slm = bool(getattr(self.config, 'freeze_slm', False))
 
@@ -143,17 +155,13 @@ class TimeMultiplexedNFATrainer:
             opt_slm = torch.optim.Adam(
                 [self.model.slm_phases], lr=self.config.lr_slm, betas=(0.9, 0.999)
             )
-            sched_slm = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt_slm, T_max=self.config.max_epoch, eta_min=self.config.lr_slm * self.config.lr_min_ratio
-            )
+            sched_slm = self._cosine(opt_slm, self.config.lr_slm)
 
         # Diffractive layers (an empty parameter at K = 0, so this optimizer is then a no-op).
         opt_layers = torch.optim.Adam(
             [self.model.layer_phases], lr=self.config.lr_layer, betas=(0.9, 0.999)
         )
-        sched_layers = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt_layers, T_max=self.config.max_epoch, eta_min=self.config.lr_layer * self.config.lr_min_ratio
-        )
+        sched_layers = self._cosine(opt_layers, self.config.lr_layer)
 
         return opt_slm, opt_layers, sched_slm, sched_layers
 
@@ -259,8 +267,9 @@ class TimeMultiplexedNFATrainer:
         I_all      = torch.cat(all_I)                               # [N, Nf] frame-averaged intensity
         target_all = torch.cat(all_target)
         # targets min-max'd over the SAME grid as f_hat (their 2001-point calibration misses the grid's true range)
-        target_all = self.criterion.normalize(target_all, *self.criterion.minmax_range(target_all))
-        fhat_all   = self.criterion.normalize(I_all, *self.criterion.minmax_range(I_all))
+        pf = self.criterion.per_function            # train_readout perfuncminmax: validate per-function min-max too
+        target_all = self.criterion.normalize(target_all, *self.criterion.minmax_range(target_all, pf))
+        fhat_all   = self.criterion.normalize(I_all, *self.criterion.minmax_range(I_all, pf))
         loss = torch.mean((fhat_all - target_all) ** 2).item()
         rmse = FunctionApproxLoss.per_function_rmse(fhat_all, target_all)
 
@@ -286,10 +295,22 @@ class TimeMultiplexedNFATrainer:
             'sched_readout': self.sched_readout.state_dict() if self.sched_readout else None,
         }
 
+    @staticmethod
+    def _atomic_save(obj, path):
+        # write then rename: a crash mid-write leaves the previous file intact, never a truncated checkpoint
+        tmp = path + '.tmp'
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+
+    def save_last(self):
+        '''Every epoch (2026-10-30): model_dir/last.pth, for resuming after a crash only (no validation, not a result).'''
+        os.makedirs(self.config.model_dir, exist_ok=True)
+        self._atomic_save(self._checkpoint_dict(), os.path.join(self.config.model_dir, 'last.pth'))
+
     def save(self, max_keep=5):
         os.makedirs(self.config.model_dir, exist_ok=True)
         path = os.path.join(self.config.model_dir, f'epoch={self.epoch:03d}.pth')
-        torch.save(self._checkpoint_dict(), path)
+        self._atomic_save(self._checkpoint_dict(), path)
 
         all_ckpts = sorted(
             glob.glob(os.path.join(self.config.model_dir, 'epoch=*.pth')),
@@ -301,7 +322,7 @@ class TimeMultiplexedNFATrainer:
     def save_best(self):
         os.makedirs(self.config.model_dir, exist_ok=True)
         path = os.path.join(self.config.model_dir, 'best.pth')
-        torch.save(self._checkpoint_dict(), path)
+        self._atomic_save(self._checkpoint_dict(), path)
         print(f'  best.pth updated (val_loss={self.best_val_loss:.3e}, epoch={self.epoch})')
 
     def load(self, ckpt_path):
@@ -425,6 +446,7 @@ def main():
 
     for epoch in range(trainer.epoch, config.max_epoch):
         trainer.epoch = epoch
+        floor_hit = False
         if trainer.criterion.train_readout == 'globalminmax':      # Pmin / Pmax of the full a-grid, fixed for this epoch
             trainer.criterion.train_p_range = trainer.calibrate_minmax()
             writer.add_scalar('minmax/calib_Pmin', float(trainer.criterion.train_p_range[0]), epoch)
@@ -452,8 +474,9 @@ def main():
             trainer.sched_decoder.step()
         if trainer.sched_readout is not None:
             trainer.sched_readout.step()
-            writer.add_scalar('readout_train/scale', float(torch.nn.functional.softplus(trainer.criterion._raw_scale)), epoch)
-            writer.add_scalar('readout_train/bias', float(trainer.criterion.bias), epoch)
+            # mean over functions for train_readout perfuncaffine (Nf scales / offsets); a no-op for the global affine
+            writer.add_scalar('readout_train/scale', float(torch.nn.functional.softplus(trainer.criterion._raw_scale).mean()), epoch)
+            writer.add_scalar('readout_train/bias', float(trainer.criterion.bias.mean()), epoch)
 
         writer.add_scalar('loss/train',        run_loss,        epoch)
         writer.add_scalar('key_gnorm/train',   run_slm_gnorm,   epoch)
@@ -473,7 +496,10 @@ def main():
             msg = f'<epoch:{epoch:3d}> loss_train:{run_loss:.3e}\n'
             print_and_save_msg(msg, log_file)
 
-        if epoch % config.checkpoint_save == 0 or epoch == config.max_epoch - 1:
+        # val_dense_epochs N (2026-11-11): also validate (and save) every epoch while epoch < N -- bench runs that reach a
+        # floor within a few epochs and then spike back up
+        if (epoch % config.checkpoint_save == 0 or epoch == config.max_epoch - 1
+                or epoch < int(getattr(config, 'val_dense_epochs', 0) or 0)):
             val_loss, rmse, val_de, (val_pmin, val_pmax) = trainer.evaluate(val_loader)
             writer.add_scalar('minmax/val_Pmax', val_pmax, epoch)
             writer.add_scalar('minmax/val_Pmin', val_pmin, epoch)
@@ -494,6 +520,23 @@ def main():
             if val_loss < trainer.best_val_loss:
                 trainer.best_val_loss = val_loss
                 trainer.save_best()
+
+            # 2026-11-08: end once the validation RMSE reaches config.stop_rmse (continuous runs at the float32 floor)
+            floor_hit = getattr(config, 'stop_rmse', None) is not None and rmse.mean().item() <= config.stop_rmse
+
+        trainer.save_last()   # after best_val_loss is updated, so a resume continues with the right best
+
+        if floor_hit:
+            print_and_save_msg(f'stop_rmse {config.stop_rmse:.1e} reached (val rmse_mean {rmse.mean().item():.3e}): stopping\n',
+                               log_file)
+            break
+
+        # TEMPORARY (2026-11-01): end early while keeping the max_epoch lr schedule (continuous runs that hit the float32
+        # floor within a few epochs); best.pth is still chosen by validation. Remove with config.stop_epoch.
+        if getattr(config, 'stop_epoch', None) is not None and epoch >= config.stop_epoch:
+            print_and_save_msg(f'stop_epoch {config.stop_epoch} reached: stopping (lr schedule of max_epoch '
+                               f'{config.max_epoch} kept)\n', log_file)
+            break
 
     writer.close()
     print('===> Training Complete')

@@ -1,0 +1,77 @@
+Design values ([set] = from --set, [derived] = from formula):
+  device profile = lab: key SLM 8.07 um (16.15 sim px), encoding SLM 4.5 um (9 sim px), sim 0.5 um, camera 5.86 um (12 sim px), N_sim 6720 (3.36 mm), gaps 35.9, 176 mm
+  N_trainable_features = 40960 [derived]  (formula: ceil(r*2*N_alpha*Nf), r=1.25, N_alpha=4, Nf=4096)
+  layer_size     = 0  (K = 0: no diffractive layers, only the phase keys train)
+  phase_key_size = 414 [set]  (formula: detector array / key_det_fill 0.9) -> 6687 sim px
+  detectors      = 64 x 64  (formula: sqrt(Nf)); size 48 px, pitch 96 x 96 px
+  encoding mode  = constant: Np = 4 px per frame, N_alpha = 4 harmonics; displayed alpha = 0 .. 3 (targets centered); background transparent (background_opaque auto)
+  encoding       = 2 x 2 px (rows x cols), 110 SLM px each, gap 0 -> 220 x 220 SLM px = 1980 x 1980 sim px
+  encoding tiles = full -> extent 5940 sim px
+  SLM phase      = 8-bit: 256 levels, step 2pi/256 (straight-through gradient)
+  readout        = val / test: f_hat = (I - Pmin) / (Pmax - Pmin), Pmin / Pmax over all detectors and the a-grid; training loss: learned scale * I + offset, discarded after training (train_readout affine)
+  decoder (E+D)  =736 x 736 SLM px (set) -> 6624 sim px, one per frame (M = 1), trainable on every pixel (incl. encoding pixels), phase init 0
+<epoch:  0> loss_train:2.233e-03
+<epoch:  0> loss_val:2.506e-03  rmse_mean:4.926e-02  rmse_max:9.217e-02  diff_eff:3.850e-02
+<epoch:  1> loss_train:6.610e-04
+<epoch:  1> loss_val:3.724e-03  rmse_mean:6.059e-02  rmse_max:9.060e-02  diff_eff:3.668e-02
+<epoch:  2> loss_train:4.869e-04
+<epoch:  2> loss_val:3.990e-03  rmse_mean:6.280e-02  rmse_max:9.172e-02  diff_eff:3.337e-02
+<epoch:  3> loss_train:4.083e-04
+<epoch:  3> loss_val:5.230e-03  rmse_mean:7.198e-02  rmse_max:9.823e-02  diff_eff:3.013e-02
+<epoch:  4> loss_train:3.597e-04
+<epoch:  4> loss_val:3.763e-03  rmse_mean:6.107e-02  rmse_max:8.200e-02  diff_eff:2.739e-02
+<epoch:  5> loss_train:3.323e-04
+<epoch:  5> loss_val:3.087e-03  rmse_mean:5.526e-02  rmse_max:8.286e-02  diff_eff:2.537e-02
+<epoch:  6> loss_train:3.086e-04
+<epoch:  6> loss_val:3.752e-03  rmse_mean:6.099e-02  rmse_max:9.080e-02  diff_eff:2.370e-02
+<epoch:  7> loss_train:2.918e-04
+<epoch:  7> loss_val:4.985e-03  rmse_mean:7.036e-02  rmse_max:1.057e-01  diff_eff:2.238e-02
+<epoch:  8> loss_train:2.810e-04
+<epoch:  8> loss_val:4.230e-03  rmse_mean:6.482e-02  rmse_max:9.217e-02  diff_eff:2.149e-02
+<epoch:  9> loss_train:2.682e-04
+<epoch:  9> loss_val:4.191e-03  rmse_mean:6.448e-02  rmse_max:9.664e-02  diff_eff:2.049e-02
+<epoch: 10> loss_train:2.614e-04
+<epoch: 10> loss_val:3.763e-03  rmse_mean:6.110e-02  rmse_max:8.289e-02  diff_eff:1.984e-02
+<epoch: 11> loss_train:2.568e-04
+<epoch: 12> loss_train:2.471e-04
+<epoch: 13> loss_train:2.422e-04
+<epoch: 14> loss_train:2.378e-04
+<epoch: 15> loss_train:2.318e-04
+<epoch: 15> loss_val:2.743e-03  rmse_mean:5.212e-02  rmse_max:7.421e-02  diff_eff:1.710e-02
+<epoch: 16> loss_train:2.267e-04
+<epoch: 17> loss_train:2.244e-04
+<epoch: 18> loss_train:2.191e-04
+<epoch: 19> loss_train:2.176e-04
+<epoch: 20> loss_train:2.158e-04
+<epoch: 20> loss_val:2.879e-03  rmse_mean:5.340e-02  rmse_max:7.550e-02  diff_eff:1.538e-02
+<epoch: 21> loss_train:2.122e-04
+<epoch: 22> loss_train:2.079e-04
+<epoch: 23> loss_train:2.074e-04
+<epoch: 24> loss_train:2.026e-04
+<epoch: 25> loss_train:2.007e-04
+<epoch: 25> loss_val:2.549e-03  rmse_mean:5.024e-02  rmse_max:7.106e-02  diff_eff:1.395e-02
+<epoch: 26> loss_train:1.995e-04
+<epoch: 27> loss_train:1.981e-04
+<epoch: 28> loss_train:1.958e-04
+<epoch: 29> loss_train:1.940e-04
+<epoch: 30> loss_train:1.908e-04
+<epoch: 30> loss_val:3.133e-03  rmse_mean:5.578e-02  rmse_max:7.936e-02  diff_eff:1.286e-02
+<epoch: 31> loss_train:1.891e-04
+<epoch: 32> loss_train:1.881e-04
+<epoch: 33> loss_train:1.867e-04
+<epoch: 34> loss_train:1.847e-04
+<epoch: 35> loss_train:1.826e-04
+<epoch: 35> loss_val:3.803e-03  rmse_mean:6.151e-02  rmse_max:8.196e-02  diff_eff:1.189e-02
+<epoch: 36> loss_train:1.814e-04
+<epoch: 37> loss_train:1.783e-04
+<epoch: 38> loss_train:1.791e-04
+<epoch: 39> loss_train:1.763e-04
+<epoch: 40> loss_train:1.759e-04
+<epoch: 40> loss_val:3.363e-03  rmse_mean:5.780e-02  rmse_max:7.842e-02  diff_eff:1.102e-02
+<epoch: 41> loss_train:1.740e-04
+<epoch: 42> loss_train:1.736e-04
+<epoch: 43> loss_train:1.707e-04
+<epoch: 44> loss_train:1.699e-04
+<epoch: 45> loss_train:1.693e-04
+<epoch: 45> loss_val:3.315e-03  rmse_mean:5.739e-02  rmse_max:7.938e-02  diff_eff:1.027e-02
+<epoch: 46> loss_train:1.681e-04

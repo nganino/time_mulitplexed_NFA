@@ -1,0 +1,32 @@
+trained at z1 29.7 mm, z2 168.8 mm -> propagating at z1 35.87 mm, z2 175.35 mm
+checkpoint ckpt_M1\bench_M1_8bit.pth (epoch 99): M 1, z1 29.7 mm, z2 168.8 mm, key 414 PLUTO px, decoder 736 LUNA px, bin 110, detectors 4 px on a 8 px pitch (5.859999999999999 um px)
+spectral propagator: P 9.50 mm, F1 208/mm (N1 1980), F2 47.3/mm (N2 450), conv FFT 4900^2, key FFT 1188^2, LUNA FFT 2112^2, 4x4 nodes / detector
+frame check key 0: package pluto_frame vs model levels: 21 px differ, max 1 level
+frame check decoder 0, a -0.500: package luna_frame vs model levels: 5 px differ, max 1 level
+frame check decoder 0, a -0.126: package luna_frame vs model levels: 7 px differ, max 1 level
+frame check decoder 0, a +0.500: package luna_frame vs model levels: 4 px differ, max 1 level
+phase-table variant vs package levels: max phase difference PLUTO 2.3e-02 rad, LUNA 3.3e-02 rad
+slm_bmp/: *_display.bmp = what the package sends (key centre (528, 990) model frame, conjugate, phase table, PLUTO rot 180); *_modelframe.bmp = linear levels, no corrections
+zero-shot expected (linear phases), 100 a: min-max RMSE 1.127e-01, affine (reward) RMSE 8.864e-02
+zero-shot expected (table  phases), 100 a: min-max RMSE 1.138e-01, affine (reward) RMSE 8.864e-02
+  sensitivity z1 -0.5 mm   (linear): min-max 1.148e-01, affine 8.864e-02
+  sensitivity z1 +0.5 mm   (linear): min-max 1.171e-01, affine 8.864e-02
+  sensitivity z2 -0.3 mm   (linear): min-max 1.120e-01, affine 8.864e-02
+  sensitivity z2 +0.3 mm   (linear): min-max 1.157e-01, affine 8.864e-02
+  sensitivity key +3 px x  (linear): min-max 1.135e-01, affine 8.864e-02
+  sensitivity key +3 px y  (linear): min-max 1.191e-01, affine 8.864e-02
+
+camera images: raw orientation, 1200 x 1920, axis at raw corner (501, 985), cam flips (True, True); 2048 x 2048 px model window
+  linear a -0.500: mean 0.897, max 3.237  (14 s)
+  linear a -0.247: mean 0.897, max 3.587  (15 s)
+  linear a +0.005: mean 0.897, max 3.479  (14 s)
+  linear a +0.247: mean 0.897, max 3.605  (14 s)
+  linear a +0.500: mean 0.897, max 3.237  (14 s)
+  table  a -0.500: mean 0.897, max 3.227  (14 s)
+  table  a -0.247: mean 0.897, max 3.635  (14 s)
+  table  a +0.005: mean 0.897, max 3.481  (14 s)
+  table  a +0.247: mean 0.897, max 3.661  (14 s)
+  table  a +0.500: mean 0.897, max 3.227  (14 s)
+whole sensor max 3.66; inside the detector array: px max 0.72, 99.9th percentile 0.38 -> expose for the array (the rim outside saturates); BMPs: make_cmos_bmps.py
+end-to-end (linear): package captures_to_detectors on the raw sim images vs model detectors, 5 a: RMS diff 3.7e-06 of the readout range, max 4.4e-05; reward-RMSE package 8.707e-02 vs model 8.707e-02
+end-to-end (table): package captures_to_detectors on the raw sim images vs model detectors, 5 a: RMS diff 3.8e-06 of the readout range, max 4.3e-05; reward-RMSE package 8.707e-02 vs model 8.707e-02

@@ -1,0 +1,40 @@
+C:\Anaconda\envs\qpi\Lib\site-packages\torch\nn\modules\module.py:1326: UserWarning: expandable_segments not supported on this platform (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\builder\windows\pytorch\c10/cuda/CUDAAllocatorConfig.h:28.)
+  return t.to(
+checkpoint ckpt_M3\bench_M3_bin1_ep2.pth (epoch 2): M 3, z1 35.87 mm, z2 175.35 mm, key 414 px of 8.075 um, decoder 736 LUNA px of 4.5 um, bin 110, detectors 4 px on a 8 px pitch
+spectral propagator: P 10.17 mm, F1 209/mm (N1 2128), F2 47.3/mm (N2 482), conv FFT 5250^2, key FFT 1260^2, LUNA FFT 2261^2, 4x4 nodes / detector
+frame check key 0: package pluto_frame vs model levels: 5 px differ, max 1 level
+frame check decoder 0, a -0.500: package luna_frame vs model levels: 4 px differ, max 1 level
+frame check decoder 0, a +0.500: package luna_frame vs model levels: 4 px differ, max 1 level
+frame check key 1: package pluto_frame vs model levels: 2 px differ, max 1 level
+frame check decoder 1, a -0.500: package luna_frame vs model levels: 7 px differ, max 1 level
+frame check decoder 1, a +0.500: package luna_frame vs model levels: 7 px differ, max 1 level
+frame check key 2: package pluto_frame vs model levels: 4 px differ, max 1 level
+frame check decoder 2, a -0.500: package luna_frame vs model levels: 5 px differ, max 1 level
+frame check decoder 2, a +0.500: package luna_frame vs model levels: 6 px differ, max 1 level
+slm_bmp/: what the package sends for each frame m (key centre (528, 990) model frame, conjugate, phase table, PLUTO rot 180; no collimator lens). Frame m = pluto_key<m> together with luna_dec<m>.
+zero-shot expected (linear phases), 100 a: min-max RMSE 4.080e-04, affine (reward) RMSE 2.612e-04
+zero-shot expected (table  phases), 100 a: min-max RMSE 2.777e-02, affine (reward) RMSE 8.351e-03
+sensitivity (linear phases, affine = reward RMSE; trained value 2.612e-04):
+  z1 -0.5 mm            : min-max 1.023e-01, affine 4.516e-02
+  z1 +0.5 mm            : min-max 8.559e-02, affine 4.495e-02
+  z2 -0.5 mm            : min-max 5.058e-02, affine 1.874e-02
+  z2 +0.5 mm            : min-max 3.365e-02, affine 1.865e-02
+  key -3 px x           : min-max 1.718e-01, affine 8.663e-02
+  key +3 px x           : min-max 1.658e-01, affine 8.660e-02
+  key -3 px y           : min-max 1.766e-01, affine 8.635e-02
+  key +3 px y           : min-max 1.505e-01, affine 8.626e-02
+  m -0.005 (1.00463)    : min-max 9.131e-02, affine 4.610e-02
+  m +0.005 (1.01475)    : min-max 9.542e-02, affine 5.051e-02
+
+camera images (phases through the phase table = what the package produces): raw orientation, 1200 x 1920, axis at raw corner (497, 985), cam flips (True, True)
+  a -0.500: mean 0.906, max 2.512  (33 s)
+  a +0.005: mean 0.905, max 2.408  (79 s)
+  a +0.500: mean 0.906, max 2.512  (51 s)
+whole sensor max 2.51; inside the detector array: px max 1.14, 99.9th percentile 0.77 -> expose for the array; BMPs: make_cmos_bmps.py
+end-to-end: package captures_to_detectors on the raw sim images vs model detectors, 3 a: RMS diff 7.7e-07 of the readout range, max 5.4e-06
+done
+SCALE = 0.769 x the incident beam (99.9th percentile inside the detector array)
+a-0.500 array px max 1.14, saturated: 80.7 % of the frame, 0.12 % of the array
+a+0.005 array px max 1.05, saturated: 80.8 % of the frame, 0.07 % of the array
+a+0.500 array px max 1.14, saturated: 80.7 % of the frame, 0.12 % of the array
+wrote cmos_expected_array.png

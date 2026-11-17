@@ -1,0 +1,1 @@
+key_to_enc_spacing=0.0353686 last_layer_ccd_spacing=0.1764458 key_slm_dx=8.050000000000001e-06 luna_fringe=0.0909 spec_adjust=key_dy=0.740,key_dx=0.518,luna_dy=-0.362,luna_dx=-0.894,det_dy=0.314,det_dx=0.322,cam_mag=0.00336

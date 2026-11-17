@@ -57,6 +57,9 @@ def apply_saved_config(tc, saved):
         saved['key_slm_dx'] = saved['enc_slm_dx'] = saved['slm_dx']
     for k in ('slm_dx', 'sim_per_slm', 'phase_key_bin', 'layer_bin', 'layer_dx'):
         saved.pop(k, None)
+    # grid options added 2026-10-30: absent = off, as those runs were trained (the lab profile now turns them on)
+    for k, v in (('asm_band_limit', False), ('illum_taper', 0.0), ('grid_key_mult', None)):
+        saved.setdefault(k, v)
     tc.__dict__.update(saved)
     mark_explicit(tc, list(saved.keys()))
 
@@ -108,12 +111,20 @@ def describe_design(tc):
     ]
     bd = getattr(tc, 'slm_phase_bits', 'inf')
     lines.append(f'  SLM phase      = ' + ('continuous (slm_phase_bits inf)' if bd == 'inf' else
-                                        f'{bd}-bit: {2 ** bd} levels, step 2pi/{2 ** bd} (straight-through gradient)'))
+                                        f'{bd}-bit: {2 ** bd} levels, ' + (
+                                            f'measured phase table {tc.slm_phase_table} (level k -> '
+                                            f'{getattr(tc, "slm_phase_table_sign", -1):+g} * table[k])'
+                                            if getattr(tc, 'slm_phase_table', None) else f'step 2pi/{2 ** bd}')
+                                        + ' (straight-through gradient)'))
     lines.append('  readout        = val / test: f_hat = (I - Pmin) / (Pmax - Pmin), Pmin / Pmax over all detectors and the a-grid; '
                  + {'minmax': 'training loss: per-batch min-max (train_readout minmax)',
                     'globalminmax': 'training loss: global min-max, Pmin / Pmax re-measured on the a-grid every epoch '
                                     '(train_readout globalminmax)',
-                    'affine': 'training loss: learned scale * I + offset, discarded after training (train_readout affine)'
+                    'affine': 'training loss: learned scale * I + offset, discarded after training (train_readout affine)',
+                    'perfuncminmax': 'training loss AND val: per-function min-max over a (train_readout perfuncminmax; '
+                                     'test.py stays global)',
+                    'perfuncaffine': 'training loss: learned per-function scale * I + offset vs per-function min-maxed '
+                                     'targets; val per-function min-max (train_readout perfuncaffine; test.py stays global)'
                     }[getattr(tc, 'train_readout', 'affine')])
     if getattr(tc, 'decoder', False):
         lines.append(f'  decoder (E+D)  ={tc.decoder_size_px} x {tc.decoder_size_px} SLM px '
@@ -132,7 +143,8 @@ def describe_design(tc):
         checks = [('phase key', tc.phase_key_size_sim, [legs[0]]), ('layer', tc.layer_size_sim, legs[1:])]
     else:   # K = 0: the key / encoding region propagates straight to the camera
         checks = [('phase key', tc.phase_key_size_sim, legs)]
-    for name, size, lg in checks:
+    bl_grid = tc.asm_pad_factor >= 2 and bool(getattr(tc, 'asm_band_limit', False))   # light leaving the window is dropped
+    for name, size, lg in ([] if bl_grid else checks):
         sp = max(spread_px(tc, z, p) for z, p in lg)
         if size + 2 * sp > tc.N_sim:
             lines.append(f'  WARNING: {name} {size} px + 2 x {sp} px spread = {size + 2 * sp} px > '
@@ -140,7 +152,7 @@ def describe_design(tc):
     # ASM transfer-function aliasing: H's phase chirp is undersampled beyond this distance
     s = min(tc.wavelength / (2 * tc.sim_dx), 0.999)
     z_alias = tc.N_sim * tc.asm_pad_factor * tc.sim_dx ** 2 / tc.wavelength * np.sqrt(1 - s * s)
-    if max(_plane_gaps(tc)) > z_alias:
+    if max(_plane_gaps(tc)) > z_alias and not getattr(tc, 'asm_band_limit', False):   # the band limit removes it
         lines.append(f'  WARNING: longest gap {1e3 * max(_plane_gaps(tc)):.3g} mm > ASM aliasing limit '
                      f'{1e3 * z_alias:.3g} mm (N_sim * pad * sim_dx^2 / lambda) -- raise N_sim or asm_pad_factor')
     return '\n'.join(lines)
@@ -164,23 +176,42 @@ def describe_design(tc):
 # Np64 K2 M3 1.6e-2 -> 3.9e-7; the Np64 3x3 block is 144 px; bin 2 / gap 2 before, bin 3 / gap 2 until 10-22),
 # 3 px detectors on a 5 px pitch (158 px array at Nf 1024, ~80% of the K4 layer; 2026-10-21, handover 4yy).
 # Earlier: gap 0 / pitch 3 (until 10-20), pitch 6 (10-20 to 10-21; 93% of the K4 layer, too wide).
+# Sim encoding LOCKED 2026-11-01 for the paper runs (logs/PAPER_FIGURES_PLAN.md, pilot A logs/pilotA_encoding_2026-11-01):
+# single block (no 3x3 tiles), bin 12, gap 0, 150 ep. Np64 Nf1024 K2 M1 / M3: bin 8 3.1e-3 / 5.9e-4, bin 12 6.5e-4 / 2.8e-5,
+# bin 16 3.6e-4 / 4.5e-7 (floor at M3); bin 12 keeps M1 well above the floor with room left for M5. Before: 3x3 tiles, bin 6.
+# Detectors 2 px on a 4 px pitch since 2026-11-01: array / layer = pitch * sqrt(K / (2.5 Np)), independent of Nf; at pitch 5
+# the array was 104% of the layer at Np36 K4 (90% at K3). Pitch 4: Np36 K4 84%, Np64 K4 63% (10-21 optimum ~80%).
 # decoder_per_key (only used with decoder = True): lab True since 2026-10-21 -- one decoder per frame, shown on the SLM
 # with key m at no hardware cost; sim keeps one shared decoder.
 # Every profile must list the same keys: init_params applies 'sim' first, so a key only one profile sets leaks into the other.
 DEVICE_PROFILES = {
     'sim': dict(key_slm_dx=300 * 1e-9, enc_slm_dx=300 * 1e-9, sim_dx=300 * 1e-9,   # = the old 300 * nm, bit-identical
-                slm_px_max=None, camera_dx=None, pd_size_cam=3, pd_pitch_cam=5,
-                encoding_patch_scale=6, encoding_gap_blocks=0, phase_key_size=None,
+                slm_px_max=None, camera_dx=None, pd_size_cam=2, pd_pitch_cam=4,   # LOCKED 2026-11-01 (3 / 5 before)
+                encoding_patch_scale=12, encoding_gap_blocks=0, encoding_tile_pattern='single', phase_key_size=None,   # LOCKED 2026-11-01 (pilot A)
                 key_to_enc_spacing=12e-6, slm_first_layer_spacing=12e-6,     # 12 um since 2026-10-25 (6 um before;
                 interlayer_spacing=12e-6, last_layer_ccd_spacing=12e-6,      # Np64 K2 M1 3.2e-3 -> 5.5e-7, handover 4ao)
                 N_sim='auto', decoder_per_key=False,                         # auto: 512 at Np64 Nf1024 K2, 448 at K3/K4
-                encoding_zero_based=False),   # symmetric display: the layers act as the PSF coefficient bank (theory)
-    'lab': dict(key_slm_dx=4.5e-6, enc_slm_dx=8e-6, sim_dx=1e-6,     # keys LUNA, encoding + decoder PLUTO since 2026-10-26 (4as)
-                slm_px_max=1080, camera_dx=6e-6, pd_size_cam=2, pd_pitch_cam=4,
-                encoding_patch_scale=11, encoding_gap_blocks=0, phase_key_size=400,   # gap 0 since 2026-10-26 (4ar)
+                key_det_fill=None, asm_pad_factor=1, asm_band_limit=False, illum_taper=0.0, grid_key_mult=None,
+                encoding_zero_based=False, wavelength=550e-9),   # symmetric display: the layers act as the PSF coefficient bank (theory)
+    # lab LOCKED 2026-10-30 for the final Np4 / Np9 Nf4096 curves (experimental constraints): keys on the 8 um PLUTO,
+    # encoding + decoder on the 4.5 um LUNA; key -> E+D 3 mm, E+D -> camera 2 cm; detectors 1 camera px (6 um) on a
+    # 2 px (12 um) pitch; encoding bin 'fit' (largest bin whose tiled encoding block fits inside the detector array);
+    # key (and decoder) = detector array / 0.8; sim_dx 0.5 um = the only pitch dividing 8, 4.5 and 6 um (1 um: 10-14 %
+    # readout error, logs/grid_study_2026-10-30); asm_pad_factor 2 (pad 1 wraps light back: 3-80 % error).
+    # Grid (grid_study3): N_sim = 1.5 x the widest plane (the key, 1.44 mm -> 2880 at 0.5 um, FFT 5760; user's choice 10-30
+    # for speed), pad 2, band-limited ASM, illumination tapered over the outer 12.5 % of the grid: 1.0 % readout error vs
+    # the converged estimate (2 x: 0.34 %, the 0.5 um pixel floor is 0.45 %; hard illumination edge 11 %).
+    # Before 10-30: keys LUNA 4.5 um, encoding PLUTO 8 um, sim 1 um, 3 / 3 mm, detectors 2 / 4 px, bin 11, pad 1.
+    # 2026-10-31: wavelength 635 nm (the lab laser; as in the E+D experiment, arXiv 2606.01032); E+D -> camera 5 mm =
+    # the effective distance of a 4f relay in front of the camera (2 cm direct: 0.96 mm aperture -> NA 0.024, ~14 um spot >
+    # the 12 um detector pitch, M1 never trained; 5 mm: M1 val 8.7e-3 at epoch 10). The relay is ideal (no lens aperture).
+    'lab': dict(key_slm_dx=8e-6, enc_slm_dx=4.5e-6, sim_dx=0.5e-6,
+                slm_px_max=1080, camera_dx=6e-6, pd_size_cam=1, pd_pitch_cam=2,
+                encoding_patch_scale='fit', encoding_gap_blocks=0, encoding_tile_pattern='full', phase_key_size=400, key_det_fill=0.8,
                 key_to_enc_spacing=3e-3, slm_first_layer_spacing=3e-3,
-                interlayer_spacing=3e-3, last_layer_ccd_spacing=3e-3, N_sim='auto', decoder_per_key=True,
-                encoding_zero_based=True),    # asymmetric display since 2026-10-26: E+D (K = 0, transparent) gains from it (4ac/4ae)
+                interlayer_spacing=3e-3, last_layer_ccd_spacing=5e-3, N_sim='auto', decoder_per_key=True,
+                asm_pad_factor=2, asm_band_limit=True, illum_taper=0.25, grid_key_mult=1.5,
+                encoding_zero_based=True, wavelength=635e-9),    # asymmetric display since 2026-10-26: E+D (K = 0, transparent) gains from it (4ac/4ae)
 }
 
 def _int_ratio(a, b, what):
@@ -227,18 +258,23 @@ ENCODING_TILE_NAMES = {'single': '000010000',   # one patch in the centre (origi
                        'x':      '101010101',   # centre + 4 diagonal copies
                        'plus':   '010111010',   # centre + 4 edge copies
                        'full':   '111111111',   # all 9 cells (one continuous block at gap 0)
-                       'full5':  '1' * 25}      # 5x5 grid of copies (added 2026-10-15)
+                       'full5':  '1' * 25,      # 5x5 grid of copies (added 2026-10-15)
+                       'full4':  '1' * 16,      # 4x4 / 6x6 grids of copies (2026-11-12): even grids, so the block's
+                       'full6':  '1' * 36,      # centre is the corner between the 4 central copies (half-patch offsets)
+                       'full8':  '1' * 64}      # 8x8 (2026-11-12: bench bin 55 x 8 = 880 px block)
 
 def encoding_tile_cells(pattern):
-    '''Tile pattern (a name in ENCODING_TILE_NAMES, or a row-major '0'/'1' string of 9 or 25 chars for
-    a 3x3 or 5x5 grid centred on the original patch) -> list of (row, col) offsets where a patch copy
-    sits: in {-1, 0, 1} for 3x3, {-2, ..., 2} for 5x5.'''
+    '''Tile pattern (a name in ENCODING_TILE_NAMES, or a row-major '0'/'1' string of 9, 16, 25, 36 or 64 chars for
+    a 3x3, 4x4, 5x5, 6x6 or 8x8 grid centred on the original patch position) -> list of (row, col) offsets, in patch
+    copies, where a copy sits: {-1, 0, 1} for 3x3, {-2, ..., 2} for 5x5; even grids use half-integer offsets
+    ({-2.5, ..., 2.5} for 6x6), so the block stays centred where the single patch was.'''
     bits = ENCODING_TILE_NAMES.get(str(pattern).lower(), str(pattern))
     n = int(round(np.sqrt(len(bits))))
-    assert n * n == len(bits) and n in (3, 5) and set(bits) <= {'0', '1'} and '1' in bits, \
-        f"encoding_tile_pattern must be one of {list(ENCODING_TILE_NAMES)} or 9 / 25 chars of 0/1, got {pattern!r}"
-    h = n // 2
-    return [(i // n - h, i % n - h) for i, b in enumerate(bits) if b == '1']
+    assert n * n == len(bits) and n in (3, 4, 5, 6, 8) and set(bits) <= {'0', '1'} and '1' in bits, \
+        f"encoding_tile_pattern must be one of {list(ENCODING_TILE_NAMES)} or 9 / 16 / 25 / 36 / 64 chars of 0/1, got {pattern!r}"
+    h = (n - 1) / 2
+    return [(i // n - h, i % n - h) if n % 2 == 0 else (i // n - n // 2, i % n - n // 2)
+            for i, b in enumerate(bits) if b == '1']
 
 def recompute_derived(tc):
     '''Recompute everything that depends on other config values.'''
@@ -257,7 +293,16 @@ def recompute_derived(tc):
     # Camera pitch -> sim pitch; detector size / pitch are whole camera pixels (metre values derived for display)
     if tc.camera_dx is None:
         tc.camera_dx = tc.sim_dx
-    tc.cam_bin = _int_ratio(tc.camera_dx, tc.sim_dx, 'camera_dx / sim_dx')
+    # 2026-11-10: prop_method 'spectral' reads the detectors as exact boxes (det_pitch_m / det_size_m, any camera pitch,
+    # e.g. 5.86 um); the sim grid (whole camera px rounded) is then only used for figures
+    tc.prop_method = getattr(tc, 'prop_method', 'asm')
+    assert tc.prop_method in ('asm', 'spectral'), f'unknown prop_method {tc.prop_method!r}'
+    if tc.prop_method == 'spectral':
+        tc.cam_bin = max(1, int(round(tc.camera_dx / tc.sim_dx)))
+    else:
+        tc.cam_bin = _int_ratio(tc.camera_dx, tc.sim_dx, 'camera_dx / sim_dx')
+    tc.det_pitch_m = tc.pd_pitch_cam * tc.camera_dx
+    tc.det_size_m = tc.pd_size_cam * tc.camera_dx
     tc.photodiode_pixels = tc.pd_size_cam * tc.cam_bin
     tc.pd_row_spacing_px = tc.pd_col_spacing_px = tc.pd_pitch_cam * tc.cam_bin
     tc.photodiode_size = tc.photodiode_pixels * tc.sim_dx
@@ -280,12 +325,32 @@ def recompute_derived(tc):
     if side * side != tc.Nf:
         raise ValueError(f'Nf={tc.Nf} is not a perfect square (detector grid is sqrt(Nf) x sqrt(Nf))')
     tc.pd_num_rows = tc.pd_num_cols = side
+    # detector-array width in sim px (fit bin, key_det_fill, N_sim): whole camera px on the sim grid, or (spectral, any
+    # camera pitch) the exact width det_pitch_m / det_size_m in sim px units (2026-11-10)
+    if tc.prop_method == 'spectral':
+        tc.det_span_sim = ((side - 1) * tc.det_pitch_m + tc.det_size_m) / tc.sim_dx
+    else:
+        tc.det_span_sim = (side - 1) * tc.pd_row_spacing_px + tc.photodiode_pixels
 
     # ---- pure geometry: always recomputed -----------------------------------
     tc.layer_size_sim = footprint(tc.layer_size, tc.enc_ratio)   # layers sit on encoding-SLM-pitch pixels
 
     # ---- new NFA (function-approximation) derived params ------------------
     # Encoding-plane geometry: the patch's pixels arranged as a rows x cols grid, chooses factorization closest to square
+    # encoding_patch_scale 'fit' (lab since 2026-10-30): the largest bin whose encoding block (every tile copy, gaps
+    # included) is no wider than the detector array; the block is linear in the bin, so solve for one bin = 1 SLM px
+    if isinstance(tc.encoding_patch_scale, str):
+        if tc.encoding_patch_scale.strip().lower() == 'fit':
+            _r = max(d for d in range(1, int(np.sqrt(tc.Np)) + 1) if tc.Np % d == 0); _c = tc.Np // _r
+            _g = tc.encoding_gap_blocks
+            _cells = encoding_tile_cells(getattr(tc, 'encoding_tile_pattern', 'single'))
+            _ry = max(abs(r) for r, _ in _cells); _rx = max(abs(c) for _, c in _cells)
+            _y, _x = _r + (_r - 1) * _g, _c + (_c - 1) * _g
+            per_bin = max(_y + 2 * _ry * (_y + _g), _x + 2 * _rx * (_x + _g))      # block width in SLM px per unit bin
+            det_m = tc.det_span_sim * tc.sim_dx
+            tc.encoding_patch_scale = max(1, int(np.floor(det_m / (tc.enc_slm_dx * per_bin) + 1e-9)))
+        else:
+            tc.encoding_patch_scale = int(tc.encoding_patch_scale)
     tc.encoding_dx        = tc.enc_slm_dx * tc.encoding_patch_scale   # encoding_patch_scale = SLM px per encoding px
     tc.encoding_bin       = tc.encoding_patch_scale * tc.enc_ratio    # sim px per encoding px (display only; may be fractional)
     # patch pixels: always Np (split mode shows a new Np-pixel block on the same patch every frame)
@@ -299,8 +364,8 @@ def recompute_derived(tc):
     tc.encoding_x_num_px = _s * (tc.encoding_cols + (tc.encoding_cols - 1) * _g)
     _cells = encoding_tile_cells(getattr(tc, 'encoding_tile_pattern', 'single')) # list of (row, col) offsets (3x3: {-1, 0, 1}, 5x5: {-2..2}) where a patch copy sits
     _ry = max(abs(r) for r, _ in _cells); _rx = max(abs(c) for _, c in _cells) # furthest copy from the centre along each axis
-    tc.encoding_extent_px = max(tc.encoding_y_num_px + 2 * _ry * (tc.encoding_y_num_px + _s * _g),
-                                tc.encoding_x_num_px + 2 * _rx * (tc.encoding_x_num_px + _s * _g))
+    tc.encoding_extent_px = int(round(max(tc.encoding_y_num_px + 2 * _ry * (tc.encoding_y_num_px + _s * _g),
+                                          tc.encoding_x_num_px + 2 * _rx * (tc.encoding_x_num_px + _s * _g))))   # int: even grids give half offsets
     # the same in sim px (whole sim px spanned)
     tc.encoding_y_num_sim  = footprint(tc.encoding_y_num_px, tc.enc_ratio)
     tc.encoding_x_num_sim  = footprint(tc.encoding_x_num_px, tc.enc_ratio)
@@ -320,7 +385,7 @@ def recompute_derived(tc):
     # the last layer (4ab / 4yy). Overrides the profile key and phase_key_patch_multiple.
     fill = getattr(tc, 'key_det_fill', None)
     if fill:
-        det_span = (tc.pd_num_rows - 1) * tc.pd_row_spacing_px + tc.photodiode_pixels
+        det_span = tc.det_span_sim
         n_key = int(np.ceil(det_span / float(fill) / tc.key_ratio - 1e-6))
     elif mult is None and profile_key is not None:
         n_key = int(profile_key)
@@ -369,12 +434,18 @@ def recompute_derived(tc):
     tc.background_opaque = bo
     tc.opaque_background = (tc.num_layers > 0) if bo == 'auto' else (bo == 'true')
 
-    # N_sim 'auto': largest plane + light spread over the longest gap on both sides, rounded up to 64
+    # N_sim 'auto': largest plane + light spread over the longest gap on both sides, or (grid_key_mult set; lab since
+    # 2026-10-30, with pad 2 + band limit + tapered illumination) grid_key_mult x the largest plane; rounded up to 64
     if tc.N_sim == 'auto':
-        det_span = (tc.pd_num_rows - 1) * tc.pd_row_spacing_px + tc.photodiode_pixels
+        det_span = int(np.ceil(tc.det_span_sim - 1e-6))
         biggest = max(tc.phase_key_size_sim, tc.layer_size_sim, tc.encoding_extent_sim, det_span,
                       tc.decoder_size_sim if tc.decoder else 0)
-        need = biggest + 2 * max(spread_px(tc, z, p) for z, p in _plane_legs(tc))
+        if tc.prop_method == 'spectral':
+            need = biggest + 2 * tc.cam_bin                    # figures only: just hold every plane
+        elif getattr(tc, 'grid_key_mult', None):
+            need = float(tc.grid_key_mult) * biggest
+        else:
+            need = biggest + 2 * max(spread_px(tc, z, p) for z, p in _plane_legs(tc))
         tc.N_sim = int(-(-need // 64) * 64)
     tc.run_name = _build_run_name(tc)
     _build_log_paths(tc)
@@ -386,7 +457,7 @@ def init_params():
     #  Physical constants & optical parameters                            #
     # ------------------------------------------------------------------ #
     nm, um, mm, cm = 1e-9, 1e-6, 1e-3, 1e-2
-    tc.wavelength = 550 * nm 
+    tc.wavelength = 550 * nm   # overridden by the device profile (sim 550 nm, lab 635 nm since 2026-10-31)
     tc.ridx_air   = 1.0
     # ------------------------------------------------------------------ #
     #  Device profile & simulation grid                                  #
@@ -399,6 +470,24 @@ def init_params():
     tc.device_profile = 'sim'
     tc.guard_orders   = 2   # light spread assumed up to this many diffraction orders of one SLM pixel (N_sim auto + wrap warning)
     tc.asm_pad_factor = 1
+    tc.asm_band_limit = False   # Matsushima band limit on the ASM transfer function (wave_prop.py; lab profile: True)
+    tc.illum_taper    = 0.0     # cosine taper of the illumination over this fraction of the grid (model.py; lab profile: 0.25)
+    tc.grid_key_mult  = None    # N_sim 'auto' = this x the widest plane instead of plane + light spread (lab profile: 2.0)
+    # 2026-11-10: 'asm' = sim-grid angular spectrum (default); 'spectral' = per-plane spectral propagator for the K = 0 E+D
+    # lab model at long distances (wave_prop.SpectralLabProp; bands = mult x geometric reach, P = mult x the system size)
+    tc.prop_method    = 'asm'
+    tc.spec_F1_mult   = 1.25
+    tc.spec_F2_mult   = 1.25
+    tc.spec_P_mult    = 1.25
+    # 2026-11-16 (gap_analysis_11_16): bench non-idealities fitted to the 11-14 zero-shot, spectral propagator only.
+    # luna_fringe w: LUNA pixel crosstalk, each displayed phase -> (1 - 4w) itself + w each of its 4 neighbours (fit 0.09).
+    # spec_adjust: 'key_dy=..,key_dx=..' (PLUTO px), 'luna_dy/luna_dx' (LUNA px), 'det_dy/det_dx' (camera px),
+    # 'cam_mag' (fraction, scales the detector grid and boxes); '' = trained geometry
+    tc.luna_fringe    = 0.0
+    tc.spec_adjust    = ''
+    tc.spec_kappa     = 4.0    # + kappa / sqrt(lambda z) on each band (Fresnel width; matters at Fresnel number < 1)
+    tc.spec_taper     = 0.3
+    tc.spec_gl        = 4      # Gauss-Legendre nodes per detector side
     tc.r = 1.25 # scaling factor of the diffractive layer's feature count
 
     # ------------------------------------------------------------------ #
@@ -410,20 +499,14 @@ def init_params():
     tc.a_max = 0.5                
 
     tc.encoding_freq_step = 1     # phi_in(p;a) = 2*pi*encoding_freq_step*alpha_p*a
-    tc.centered_harmonics = True  # alpha = -N_alpha//2 .. N_alpha - 1 - N_alpha//2 (symmetric, as in the earlier papers; default
-                                  # since 2026-10-20); False = 0 .. N_alpha-1 (every run before that date)
+    tc.centered_harmonics = True  # alpha = -N_alpha//2 .. N_alpha - 1 - N_alpha//2 for synthezing target functions
     tc.encoding_zero_based = False  # True: the SLM shows alpha_p = 0 .. N_alpha-1 (p = 0 .. N_alpha-1) even with centered targets.
-                                    # Identical targets; puts the a-independent background (frequency 0) at the band edge (2026-10-22).
-                                    # Only matters at K = 0: at K > 0 the background is opaque and both displays give identical results (4af)
-    # Background (non-encoding pixels of the encoding plane), since 2026-10-23: 'auto' = OPAQUE when K > 0 (the layers are
-    # the coefficient bank; no a-independent DC term), transparent at K = 0 (lab E+D needs the background light).
-    # 'true' / 'false' force it -- only for controls (added 2026-10-24 for the transparent-background check)
     tc.background_opaque = 'auto'
     # encoding_patch_scale (binning: each p value takes up bin x bin SLM pixels) and encoding_gap_blocks (zero-phase
     # bin-sized blocks between adjacent encoding pixels) come from the device profile (sim: 6 / 0, lab: 11 / 0), in SLM px of the encoding SLM.
     # Harmonic p sits at row p // cols, column p % cols of the rows x cols patch (p = 0 top-left).
 
-    tc.encoding_tile_pattern = 'full'   #  copies the patch to a 3x3 grid around the centre, 'single' = one patch
+    tc.encoding_tile_pattern = 'full'   # overridden by the device profile (sim 'single' since 2026-11-01, lab 'full' = 3x3 copies of the patch)
     tc.encoding_mode = 'constant'       # how harmonics are spread over the M keys (constant: all keys see all Np harmonics; split: key m sees only block of harmonics Np = m*Np .. (m+1)*Np-1)
                                         # const: N_alpha = Np; split: N_alpha = Np*M and N = r*2*N_alpha*Nf grows with M
     tc.func_seed = 0                    # random seed for generating Nf target functinons
@@ -434,7 +517,6 @@ def init_params():
     tc.M             = 1   # number of phase keys
     tc.num_layers    = 2   
     tc.scale_layer_with_M = False  # N = r * 2*Np*Nf*M  (True) or N = r * 2*Np*Nf (False)
-    # layers sit on SLM pixels at the encoding pitch (enc_slm_dx)
 
     # ------------------------------------------------------------------ #
     #  Phase-key plane                                                   #   
@@ -451,12 +533,10 @@ def init_params():
     tc.decoder      = False   # True: train a phase mask on every non-encoding SLM pixel of the encoding plane
     tc.decoder_size = None    # encoding-SLM px per side; None -> the key's physical width (= phase_key_size at equal pitches), capped at slm_px_max
     tc.decoder_over_encoding = True   # True (default since 2026-10-18): decoder also trains on the encoding pixels (every pixel of its square; superset of False)
-    # decoder_per_key comes from the device profile (lab True: M decoders, decoder m shown with key m; sim False: one shared)
-
-    # SLM phase quantisation (2026-10-21): 'inf' = continuous phase (default, as before); an int b = 2^b equally spaced
-    # levels in [0, 2pi) for every SLM-displayed phase (keys, encoding + decoder plane, layers). Trained with a
-    # straight-through estimator (forward quantised, gradient as if continuous). E.g. --set slm_phase_bits=8
     tc.slm_phase_bits = 'inf'
+    tc.slm_phase_table = None        # 2026-11-11: JSON with 'pluto' / 'luna' measured phase (rad) per level (path relative to
+                                     # code/, e.g. 'experiment/phase_tables.json'); None = linear 2 pi k / 2^bits. Needs int bits
+    tc.slm_phase_table_sign = -1     # level k realises sign * table[k]: -1 = the bench's conjugate drive (TRAINING_ADJUSTMENTS)
 
     tc.mask_init_method = 'normal'
     tc.mask_init_std   = 1.0   # std of the phase keys' normal init
@@ -499,7 +579,9 @@ def init_params():
     tc.lr_slm     = 1e-2   # learning rate for the phase-key plane
     tc.lr_layer   = 1e-2   # learning rate for the diffractive layers
     tc.lr_decoder = 1e-2   # learning rate for the encoding-plane decoder (only used when decoder = True)
+    tc.lr_readout = None   # learning rate for the training-only affine readout scale / offset (None -> lr_slm; added 2026-11-04)
     tc.lr_min_ratio = 1e-3 # cosine schedules anneal each lr to lr * lr_min_ratio (1e-3: 1e-2 -> 1e-5, the value used before 2026-10-23)
+    tc.lr_warmup_epochs = 0  # 2026-11-11: W > 0 = linear warm-up (lr * (e+1)/(W+1) at epoch e < W) before the cosine, every group
     tc.meas_noise_std = 0.0  # End-to-end measurement-noise injection (SLM + decoder co-adapt to the sim->real gap).
     tc.phase_slm_noise_std = 0.0  # training only: Gaussian phase noise stdev (rad) on every displayed SLM px (keys, encoding + decoder,
                                 # layers), fresh each forward pass, added after slm_phase_bits rounding (8-bit rounding ~ 2pi/256/sqrt(12)
@@ -509,15 +591,19 @@ def init_params():
     tc.train_readout = 'affine'   # training loss only: 'affine' (default since 2026-10-24: learned global scale + offset, discarded
                                   # after training), 'globalminmax' (the test's min-max with Pmin / Pmax from the full a-grid,
                                   # re-measured every epoch, constant within it) or 'minmax' (per-batch; 20-680x worse at Np36,
-                                  # logs/Np36_M123_ep400_*). Every
-                                  # val / test number is global min-max either way
+                                  # logs/Np36_M123_ep400_*). Every val / test number is global min-max either way
+                                  # (except 'perfuncminmax', 2026-11-13: per-function min-max in training and val, and
+                                  # 'perfuncaffine', 2026-11-14: learned per-function scale + offset, val per-function min-max)
 
     # ------------------------------------------------------------------ #
     #  Logging & checkpoints                                             #
     # ------------------------------------------------------------------ #
     tc.checkpoint_save  = 10 # every (checkpoint_save) epochs, save a checkpoint (model + config)
     tc.checkpoint_print = 1
-    tc.ckpt_to_load = None 
+    tc.val_dense_epochs = 0  # 2026-11-11: validate + save every epoch while epoch < this (then every checkpoint_save)
+    tc.stop_epoch = None     # TEMPORARY (2026-11-01): stop after this epoch, keeping the max_epoch lr schedule (train.py)
+    tc.stop_rmse = None      # 2026-11-08: stop once the val rmse_mean <= this (checked at validation epochs; lr schedule of max_epoch kept)
+    tc.ckpt_to_load = None
     tc.load_weights_only = False
 
     tc._explicit = set()    # keys set via --set / a loaded checkpoint (never re-derived)

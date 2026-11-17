@@ -21,11 +21,17 @@ Outputs saved to <out_dir>/:
     phase_key_similarity.png    — pairwise phase similarity between the M keys
                                    (low similarity = keys are learning genuinely
                                    different things -- see _save_mask_similarity)
-    key_evolution.png           — per key: the phase key, and the intensity and phase of its
-                                   field at the encoding plane
+    key_evolution.png           — per key: the phase key, the intensity and phase of its field at
+                                   the encoding plane, its own contribution c_m(a) to the output
+                                   (sum over keys = f_hat), and the spectrum of c_m (split: frame
+                                   m's harmonic block shaded)
     encoding_frames.png         — split mode only: encoding phase of every frame
     per_function_rmse.npy       — [Nf] test RMSE per function / detector
 Optionally appends a summary row (loss, RMSE mean/max/min) to --csv, if given.
+
+--readout global (default): min-max over the whole test grid AND all detectors (paper Eq. 9), targets likewise.
+--readout perfunc (2026-11-16): each function k min-max'd over the test grid on its own, f_hat and target (the bench
+    readout; matches validation of the train_readout perfunc* runs). Default out_dir is then <run>/test_perfunc.
 '''
 
 import sys, os
@@ -53,7 +59,7 @@ from loss import FunctionApproxLoss
 
 # ─────────────────────────── evaluation loop ──────────────────────────────── #
 
-def _eval_loop(model, loader, criterion, device, desc='Evaluating'):
+def _eval_loop(model, loader, criterion, device, desc='Evaluating', per_function=False):
     '''
     Single evaluation pass over the dense a-grid loader. The min-max readout uses Pmin / Pmax over the
     WHOLE grid and all detectors (the exact definition), so f_hat is formed after the pass.
@@ -64,7 +70,7 @@ def _eval_loop(model, loader, criterion, device, desc='Evaluating'):
         'a'      : [N] input values
         'f_hat'  : [N, Nf] normalized model output
         'target' : [N, Nf] true function values, min-max normalised over this grid (as f_hat)
-        'p_range': (Pmin, Pmax) of the frame-averaged intensity over the grid
+        'p_range': (Pmin, Pmax) of the frame-averaged intensity over the grid (scalars; per_function: [1, Nf] each)
         'loss'   : [full-grid MSE] (a 1-element list)
         'de'     : [N, T] diffraction efficiency per sample and phase key
                    (diagnostic only, see loss.FunctionApproxLoss.diffraction_efficiency)
@@ -101,9 +107,10 @@ def _eval_loop(model, loader, criterion, device, desc='Evaluating'):
         agg[key] = agg[key][order]
 
     # targets min-max'd over the SAME grid as f_hat (their 2001-point calibration misses the grid's true range)
-    agg['target'] = criterion.normalize(agg['target'], *criterion.minmax_range(agg['target']))
+    # per_function (--readout perfunc): every function over a on its own, f_hat and target alike
+    agg['target'] = criterion.normalize(agg['target'], *criterion.minmax_range(agg['target'], per_function))
     I_mean = agg['I'].mean(1)                                 # [N, Nf] frame average, as in loss._detector_to_function
-    agg['p_range'] = criterion.minmax_range(I_mean)
+    agg['p_range'] = criterion.minmax_range(I_mean, per_function)
     agg['f_hat'] = criterion.normalize(I_mean, *agg['p_range'])
     agg['loss'] = [torch.mean((agg['f_hat'] - agg['target']) ** 2).item()]
     return agg
@@ -277,7 +284,7 @@ def _save_test_summary(agg, rmse, config, model, save_path, n_show=4, dpi=200, e
         if i == 0:
             ax.legend(fontsize=7)
 
-    fig.suptitle(f'Test summary   mean RMSE={rmse.mean():.2e}   max RMSE={rmse.max():.2e}\nr={config.r}  {_enc_tag(config)}  Nf={config.Nf}  M={config.M}  K={config.num_layers}  {_bg_tag(model)}\nkey_to_input_dist = {config.key_to_enc_spacing} key_size = {config.phase_key_size}', fontsize=10)
+    fig.suptitle(f'Test summary ({getattr(config, "test_readout", "global")} min-max readout)   mean RMSE={rmse.mean():.2e}   max RMSE={rmse.max():.2e}\nr={config.r}  {_enc_tag(config)}  Nf={config.Nf}  M={config.M}  K={config.num_layers}  {_bg_tag(model)}\nkey_to_input_dist = {config.key_to_enc_spacing} key_size = {config.phase_key_size}', fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(save_path, bbox_inches='tight')
     plt.close(fig)
@@ -515,17 +522,34 @@ def _save_decoder_mask(model, config, out_dir, dpi=200):
     print(f'Decoder mask saved → {path}')
 
 
-def _save_key_evolution(model, config, out_dir, dpi=200):
+def _save_key_evolution(model, config, agg, out_dir, dpi=200):
     '''
-    M rows x 3 columns, one row per phase key m:
+    M rows x 5 columns, one row per phase key m:
       col 1: learned phase key m
       col 2: intensity key m deposits on the encoding plane (the key's field only, before the encoding / decoder
              phase and before the opaque-background mask at K > 0), cropped to the layer aperture (K = 0: the key),
              encoding patch copies outlined, mean intensity over them vs. the unit incident intensity
       col 3: phase of key m's field at the encoding plane (same crop / outline, wrapped to [0, 2pi))
+      col 4: key m's OWN contribution to the output, c_m(a) = (I_m(a) - Pmin) / (M (Pmax - Pmin)), for the
+             median-error function of the full model: the min-max readout of the frame average is exactly
+             f_hat = sum_m c_m, so c_m is what frame m adds (not a cumulative sum over keys 0..m)
+      col 5: spectrum of c_m over a: |DFT| at integer frequency nu = 0 .. N_alpha - 1 (the test grid is uniform over
+             one period of a), mean over all Nf functions, normalised to the largest bin over all keys. Split mode:
+             frame m's displayed harmonics |alpha| are shaded (interference with the transparent background puts the
+             frame's own alphas into the intensity; differences within the frame land at nu < Np).
     At K > 0 only the outlined encoding pixels pass on (opaque background); at K = 0 the whole field does.
     '''
     M = model.M
+    # per-key contributions in the min-max readout units (sum over m = f_hat)
+    Pmin, Pmax = (v.double() for v in agg['p_range'])                  # scalars, or [1, Nf] with --readout perfunc
+    C = ((agg['I'].double() - Pmin) / (M * (Pmax - Pmin))).numpy()     # [N, M, Nf]
+    rmse_full = FunctionApproxLoss.per_function_rmse(agg['f_hat'], agg['target'])
+    k_show = int(torch.argsort(rmse_full)[len(rmse_full) // 2])
+    a_np = agg['a'].numpy()
+    NA = model.N_alpha
+    spec = np.abs(np.fft.rfft(C, axis=0))[:NA].mean(2).T                # [M, NA] (a grid uniform over one period)
+    spec = spec / max(spec[:, 1:].max(), 1e-300)                        # DC excluded from the scale
+    shift = model.encoding_shift
     with torch.no_grad():
         key_I, key_phi = model.key_intensity_at_encoding()       # [M, N_sim, N_sim] each
         key_I = key_I.cpu().numpy()
@@ -545,7 +569,7 @@ def _save_key_evolution(model, config, out_dir, dpi=200):
             in_patch[r0:r0 + h, q0:q0 + w] = True
     foot = 'on encoding pixels' if model.opaque_background else 'in footprint'
 
-    fig, axes = plt.subplots(M, 3, figsize=(14, 3.6 * M), dpi=dpi, squeeze=False)
+    fig, axes = plt.subplots(M, 5, figsize=(24, 3.6 * M), dpi=dpi, squeeze=False)
     def phase_cbar(im, ax):
         cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
         cb.set_ticks([0, np.pi, 2 * np.pi]); cb.set_ticklabels(['0', 'π', '2π'])
@@ -582,9 +606,41 @@ def _save_key_evolution(model, config, out_dir, dpi=200):
         if m == 0:
             ax.set_title('Phase at encoding plane', fontsize=11, fontweight='bold')
 
+        ax = axes[m, 3]
+        ax.plot(a_np, C[:, m, k_show], '-', color='tab:red', lw=1.4)
+        ax.set_xlim(a_np[0], a_np[-1])
+        if m == M - 1:
+            ax.set_xlabel('a')
+        ax.set_ylabel(f'c_{m}(a)', fontsize=9)
+        ax.set_title(f'f_{k_show}: key {m} contribution, mean {C[:, m, k_show].mean():.3f}, '
+                     f'swing {np.ptp(C[:, m, k_show]):.3f}', fontsize=9)
+        if m == 0:
+            ax.annotate('Contribution of this key alone', xy=(0.5, 1), xytext=(0, 22), xycoords='axes fraction',
+                        textcoords='offset points', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+        ax = axes[m, 4]
+        nu = np.arange(NA)
+        if model.encoding_mode == 'split':
+            al = np.arange(m * model.Np, (m + 1) * model.Np) - shift          # alphas displayed in frame m
+            lo, hi = (0 if al.min() <= 0 <= al.max() else np.abs(al).min()), np.abs(al).max()
+            ax.axvspan(lo - 0.5, hi + 0.5, color='#2a78d6', alpha=0.15, lw=0, label=f'frame {m}: |alpha| {lo}-{hi}')
+            ax.axvspan(-0.5, model.Np - 0.5, color='0.5', alpha=0.10, lw=0, label=f'within-frame differences < {model.Np}')
+            inb = spec[m][(nu >= lo) & (nu <= hi) & (nu > 0)].sum() / max(spec[m][1:].sum(), 1e-300)
+            ax.set_title(f'{100 * inb:.0f}% of the non-DC spectrum inside |alpha| {lo}-{hi}', fontsize=9)
+            ax.legend(fontsize=7, loc='upper right')
+        ax.bar(nu[1:], spec[m][1:], width=0.8, color='tab:red')
+        ax.set_xlim(-0.5, NA - 0.5); ax.set_ylim(0, 1.05)
+        if m == M - 1:
+            ax.set_xlabel('frequency nu (cycles per unit a)')
+        ax.set_ylabel('|DFT|, mean over functions', fontsize=8)
+        if m == 0:
+            ax.annotate('Spectrum of this key\'s contribution', xy=(0.5, 1), xytext=(0, 22), xycoords='axes fraction',
+                        textcoords='offset points', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
     fig.suptitle(
-        "Phase keys and each key's field at the encoding plane (before the encoding phase; cyan box = encoding footprint)\n"
-        + r'($N = r \cdot 2 N_p N_f$,  '
+        "Phase keys, each key's field at the encoding plane (before the encoding phase; cyan box = encoding footprint), "
+        f"and each key's own contribution c_m to the output (sum over m = f_hat; median-error function f_{k_show})\n"
+        + r'($N = r \cdot 2 N_\alpha N_f$,  '
         + f'r={config.r}  {_enc_tag(config)}  Nf={config.Nf}  M={config.M}  K={config.num_layers};  {_bg_tag(model)})',
         fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.97], w_pad=2.5, h_pad=2.0)
@@ -642,12 +698,14 @@ def _save_readout_calibration(agg, fits, config, model, out_dir, dpi=200):
                 label=f'{lab}: f_{k}, a = {agg["a"][n].item():+.3f}')
     r = fits
     ax.text(0.03, 0.97, f'mean per-function RMSE\n'
-            f'  min-max (this model):     {r["rmse_minmax"]:.3e}\n'
+            f'  min-max ({getattr(config, 'test_readout', 'global'):7s}):  {r["rmse_minmax"]:.3e}\n'
             f'  best global scale+offset: {r["rmse_global_affine"]:.3e}  (min-max {r["rmse_minmax"] / r["rmse_global_affine"]:.2f}x)\n'
             f'  best per-detector:        {r["rmse_detector_affine"]:.3e}  (min-max {r["rmse_minmax"] / r["rmse_detector_affine"]:.2f}x)',
             transform=ax.transAxes, va='top', ha='left', fontsize=7, family='monospace',
             bbox=dict(boxstyle='round', fc='white', ec='0.7'))
-    ax.set_xlabel('target f (global min-max)'); ax.set_ylabel('model output f_hat (min-max over the test grid)')
+    pf = getattr(config, 'test_readout', 'global') == 'perfunc'
+    ax.set_xlabel(f'target f ({"per-function" if pf else "global"} min-max)')
+    ax.set_ylabel(f'model output f_hat ({"per-function " if pf else ""}min-max over the test grid)')
     ax.set_xlim(lo, hi); ax.set_ylim(lo, hi); ax.set_aspect('equal'); ax.legend(fontsize=7, loc='lower right')
     ax.set_title(f'Readout calibration   {_enc_tag(config)}  Nf={config.Nf}  M={config.M}  K={config.num_layers}\n'
                  f'{_bg_tag(model)}', fontsize=9)
@@ -656,36 +714,9 @@ def _save_readout_calibration(agg, fits, config, model, out_dir, dpi=200):
     print(f'Readout calibration saved → {path}')
 
 
-def _save_detector_maps(fits, config, model, out_dir, dpi=200):
-    '''
-    detector_maps.png, one block per detector (row-major k = r*cols + c, like the per-detector RMSE map):
-      gain   : slope of f_hat_k against f_k (ideal 1)      offset : intercept (ideal 0)
-      modulation depth of the raw intensity P_k over a, (max - min) / (max + min): low = a constant level (DC) swamps
-      the signal; a perfect fit with Pmin = 0 gives the targets' own depth.
-    '''
-    rows, cols = config.pd_num_rows, config.pd_num_cols
-    g, o, d = (fits[k].reshape(rows, cols) for k in ('gain', 'offset', 'depth'))
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.4), dpi=dpi)
-    gs = max(abs(g - 1).max(), 1e-6); os_ = max(abs(o).max(), 1e-9)
-    for ax, img, title, kw, fmt in (
-            (axes[0], g, f'gain (ideal 1): median {np.median(g):.3f}, range {g.min():.3f}-{g.max():.3f}',
-             dict(cmap='RdBu_r', vmin=1 - gs, vmax=1 + gs), '{:.3f}'),
-            (axes[1], o, f'offset (ideal 0): median {np.median(o):.2e}', dict(cmap='RdBu_r', vmin=-os_, vmax=os_), '{:.1e}'),
-            (axes[2], d, f'modulation depth of P_k: median {np.median(d):.3f}', dict(cmap='viridis', vmin=0, vmax=1), '{:.2f}')):
-        im = ax.imshow(img, origin='upper', interpolation='nearest', **kw)
-        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cb.formatter = FuncFormatter(lambda v, pos, fmt=fmt: fmt.format(v)); cb.update_ticks()
-        ax.set_title(title, fontsize=9); ax.set_xlabel('detector column'); ax.set_ylabel('detector row')
-    fig.suptitle(f'Per-detector readout: fit f_hat_k = gain * f_k + offset, and modulation depth of the raw intensity\n'
-                 f'{_enc_tag(config)}  Nf={config.Nf}  M={config.M}  K={config.num_layers}  {_bg_tag(model)}', fontsize=10)
-    fig.tight_layout(); path = os.path.join(out_dir, 'detector_maps.png')
-    fig.savefig(path, bbox_inches='tight'); plt.close(fig)
-    print(f'Detector maps saved → {path}')
-
-
 # ──────────────────────────── main entry point ────────────────────────────── #
 
-def _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse, fits=None):
+def _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse, fits=None, readout='global'):
     '''Append one results row to the sweep CSV, creating the file if needed.'''
     row = {
         'sweep'     : sweep_name or '',
@@ -697,6 +728,7 @@ def _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse, fits=None)
         'rmse_max'  : float(rmse.max()),
         'rmse_min'  : float(rmse.min()),
         'diff_eff_mean' : float(agg['de'].mean()) if 'de' in agg else float('nan'),
+        'readout'   : readout,
     }
     if fits is not None:   # readout diagnostics (_readout_fits)
         row.update(rmse_global_affine=fits['rmse_global_affine'], rmse_detector_affine=fits['rmse_detector_affine'],
@@ -718,7 +750,7 @@ def _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse, fits=None)
     print(f'Results appended → {csv_path}')
 
 
-def _load_and_evaluate(ckpt_path):
+def _load_and_evaluate(ckpt_path, readout='global', test_batch=None):
     '''
     Load a checkpoint (config + model + criterion) and run one eval pass over its own dense test grid. 
     '''
@@ -736,6 +768,8 @@ def _load_and_evaluate(ckpt_path):
         if v is not None:
             setattr(config, k, v)
     recompute_derived(config)
+    if test_batch:   # --test_batch: memory only, the results do not depend on it
+        config.test_batch_size = int(test_batch)
 
     model     = TimeMultiplexedNFA(config).to(device)
     criterion = FunctionApproxLoss(config).to(device)
@@ -744,15 +778,17 @@ def _load_and_evaluate(ckpt_path):
     model.eval(); criterion.eval()
 
     _, _, test_loader, target_fn = get_function_approx_dataloaders(config)
-    agg = _eval_loop(model, test_loader, criterion, device, desc='Testing')
+    config.test_readout = readout
+    agg = _eval_loop(model, test_loader, criterion, device, desc='Testing', per_function=readout == 'perfunc')
     return agg, config, model, criterion
 
 
-def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_label=None):
+def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_label=None, readout='global', test_batch=None):
     ckpt_path = ckpt_path or init_params().ckpt_to_load
+    assert readout in ('global', 'perfunc'), f'unknown readout {readout!r}'
 
     if ckpt_path is not None:
-        agg, config, model, criterion = _load_and_evaluate(ckpt_path)
+        agg, config, model, criterion = _load_and_evaluate(ckpt_path, readout, test_batch)
     else:
         print('[WARNING] No checkpoint provided — evaluating random init.')
         config = init_params()
@@ -761,21 +797,22 @@ def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_l
         criterion = FunctionApproxLoss(config).to(device)
         model.eval(); criterion.eval()
         _, _, test_loader, target_fn = get_function_approx_dataloaders(config)
-        agg = _eval_loop(model, test_loader, criterion, device, desc='Testing')
+        config.test_readout = readout
+        agg = _eval_loop(model, test_loader, criterion, device, desc='Testing', per_function=readout == 'perfunc')
 
-    rmse = _print_summary(agg)
+    rmse = _print_summary(agg, tag=f'Test ({readout} min-max readout)')
 
     if out_dir is None:
         out_dir = os.path.join(
-            os.path.dirname(ckpt_path) if ckpt_path else '.', '..', 'test'
+            os.path.dirname(ckpt_path) if ckpt_path else '.', '..', 'test' if readout == 'global' else 'test_perfunc'
         )
     os.makedirs(out_dir, exist_ok=True)
 
     fits = _readout_fits(agg)
-    print(f'  Readout RMSE        : min-max {fits["rmse_minmax"]:.4e}  best global affine {fits["rmse_global_affine"]:.4e}  '
+    print(f'  Readout RMSE        : min-max ({readout}) {fits["rmse_minmax"]:.4e}  best global affine {fits["rmse_global_affine"]:.4e}  '
           f'best per-detector affine {fits["rmse_detector_affine"]:.4e}')
     if csv_path is not None:
-        _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse, fits)
+        _write_csv(csv_path, sweep_name, run_label, ckpt_path, agg, rmse, fits, readout)
 
     # Per-function RMSE [Nf], index k = detector (row*pd_num_cols + col).
     # Saved so per-detector maps / asymmetry stats can be redone without re-testing.
@@ -783,7 +820,6 @@ def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_l
 
     _save_test_summary(agg, rmse, config, model, os.path.join(out_dir, 'test_summary.png'))
     _save_readout_calibration(agg, fits, config, model, out_dir)
-    _save_detector_maps(fits, config, model, out_dir)
     _save_plane_layout(model, config, out_dir)
     _save_encoding_frames(model, config, out_dir)
 
@@ -792,7 +828,8 @@ def evaluate(ckpt_path=None, out_dir=None, csv_path=None, sweep_name=None, run_l
     _save_layer_masks(model, out_dir)
     _save_decoder_mask(model, config, out_dir)
     _save_mask_similarity(model, out_dir)
-    _save_key_evolution(model, config, out_dir)
+    if getattr(config, 'prop_method', 'asm') != 'spectral':   # needs the sim-grid key -> LUNA propagation
+        _save_key_evolution(model, config, agg, out_dir)
 
     print(f'\nAll outputs saved to: {os.path.abspath(out_dir)}')
 
@@ -809,6 +846,11 @@ if __name__ == '__main__':
     parser.add_argument('--csv',     default=None, help='CSV file to append results to')
     parser.add_argument('--sweep',   default=None, help='Sweep name (written to CSV)')
     parser.add_argument('--label',   default=None, help='Run label (written to CSV)')
+    parser.add_argument('--readout', default='global', choices=('global', 'perfunc'),
+                        help="min-max readout: 'global' (whole grid + all detectors, default) or 'perfunc' (each function "
+                             "over a on its own, the bench readout); perfunc writes to <run>/test_perfunc by default")
+    parser.add_argument('--test_batch', type=int, default=None,
+                        help='override the checkpoint test_batch_size (GPU memory only; results do not depend on it)')
     args = parser.parse_args()
 
     evaluate(
@@ -817,4 +859,6 @@ if __name__ == '__main__':
         csv_path   = args.csv,
         sweep_name = args.sweep,
         run_label  = args.label,
+        readout    = args.readout,
+        test_batch = args.test_batch,
     )

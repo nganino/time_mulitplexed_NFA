@@ -1,0 +1,29 @@
+[ppo_nmse] noise: relative detector std 0.0874 (6-a NMSE reward std vs s: {0.01: 0.0003286527387040848, 0.02: 0.0008165569345796835, 0.04: 0.0011466005962863285, 0.08: 0.0022402362502499024, 0.16: 0.0038326862835288984})
+[ppo_nmse]   ep  -1  NMSE 0.5062  RMSE 5.0108e-02
+[ppo_nmse]   ep   4  NMSE 0.5008  RMSE 4.9859e-02  rms corr 0.052 rad
+[ppo_nmse]   ep   9  NMSE 0.4962  RMSE 4.9599e-02  rms corr 0.070 rad
+[ppo_nmse]   ep  14  NMSE 0.4895  RMSE 4.9244e-02  rms corr 0.083 rad
+[ppo_nmse]   ep  19  NMSE 0.4833  RMSE 4.8907e-02  rms corr 0.095 rad
+[ppo_nmse]   ep  24  NMSE 0.4790  RMSE 4.8660e-02  rms corr 0.105 rad
+[ppo_nmse]   ep  29  NMSE 0.4740  RMSE 4.8369e-02  rms corr 0.114 rad
+[ppo_nmse]   ep  34  NMSE 0.4689  RMSE 4.8096e-02  rms corr 0.122 rad
+[ppo_nmse]   ep  39  NMSE 0.4651  RMSE 4.7913e-02  rms corr 0.130 rad
+[ppo_nmse]   ep  44  NMSE 0.4625  RMSE 4.7784e-02  rms corr 0.139 rad
+[ppo_nmse]   ep  49  NMSE 0.4594  RMSE 4.7614e-02  rms corr 0.148 rad
+[ppo_nmse]   ep  54  NMSE 0.4563  RMSE 4.7425e-02  rms corr 0.154 rad
+[ppo_nmse]   ep  59  NMSE 0.4512  RMSE 4.7144e-02  rms corr 0.162 rad
+[ppo_nmse]   ep  64  NMSE 0.4484  RMSE 4.6992e-02  rms corr 0.167 rad
+[ppo_nmse]   ep  69  NMSE 0.4454  RMSE 4.6846e-02  rms corr 0.172 rad
+[ppo_nmse]   ep  74  NMSE 0.4434  RMSE 4.6778e-02  rms corr 0.178 rad
+[ppo_nmse] done in 739 s
+[ppo_nmse_nonoise]   ep  -1  NMSE 0.5062  RMSE 5.0108e-02
+[ppo_nmse_nonoise]   ep   4  NMSE 0.5002  RMSE 4.9839e-02  rms corr 0.050 rad
+[ppo_nmse_nonoise]   ep   9  NMSE 0.4940  RMSE 4.9513e-02  rms corr 0.069 rad
+[ppo_nmse_nonoise]   ep  14  NMSE 0.4868  RMSE 4.9146e-02  rms corr 0.083 rad
+[ppo_nmse_nonoise]   ep  19  NMSE 0.4803  RMSE 4.8754e-02  rms corr 0.094 rad
+[ppo_nmse_nonoise]   ep  24  NMSE 0.4744  RMSE 4.8463e-02  rms corr 0.106 rad
+[ppo_nmse_nonoise]   ep  29  NMSE 0.4685  RMSE 4.8175e-02  rms corr 0.115 rad
+[ppo_nmse_nonoise]   ep  34  NMSE 0.4630  RMSE 4.7908e-02  rms corr 0.125 rad
+[ppo_nmse_nonoise]   ep  39  NMSE 0.4601  RMSE 4.7718e-02  rms corr 0.133 rad
+[ppo_nmse_nonoise]   ep  44  NMSE 0.4551  RMSE 4.7447e-02  rms corr 0.140 rad
+[ppo_nmse_nonoise]   ep  49  NMSE 0.4518  RMSE 4.7247e-02  rms corr 0.149 rad

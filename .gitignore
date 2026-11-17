@@ -18,3 +18,9 @@ __pycache__/
 # os
 Thumbs.db
 .DS_Store
+
+# experiment: regenerable simulation outputs (camera sims, SLM pattern dumps)
+code/experiment/**/bench_check_*/**/*.npy
+code/experiment/**/bench_check_*/**/*.bmp
+code/experiment/**/sim_*/**/*.npy
+code/experiment/**/sim_*/**/*.bmp

@@ -1,0 +1,141 @@
+Design values ([set] = from --set, [derived] = from formula):
+  device profile = lab: key SLM 8.07 um (16.15 sim px), encoding SLM 4.5 um (9 sim px), sim 0.5 um, camera 5.86 um (12 sim px), N_sim 6720 (3.36 mm), gaps 35.9, 175 mm
+  N_trainable_features = 10240 [derived]  (formula: ceil(r*2*N_alpha*Nf), r=1.25, N_alpha=4, Nf=1024)
+  layer_size     = 0  (K = 0: no diffractive layers, only the phase keys train)
+  phase_key_size = 414 [set]  (formula: detector array / key_det_fill 0.9) -> 6687 sim px
+  detectors      = 32 x 32  (formula: sqrt(Nf)); size 144 px, pitch 192 x 192 px
+  encoding mode  = constant: Np = 4 px per frame, N_alpha = 4 harmonics; displayed alpha = 0 .. 3 (targets centered); background transparent (background_opaque auto)
+  encoding       = 2 x 2 px (rows x cols), 110 SLM px each, gap 0 -> 220 x 220 SLM px = 1980 x 1980 sim px
+  encoding tiles = full -> extent 5940 sim px
+  SLM phase      = 8-bit: 256 levels, step 2pi/256 (straight-through gradient)
+  readout        = val / test: f_hat = (I - Pmin) / (Pmax - Pmin), Pmin / Pmax over all detectors and the a-grid; training loss: learned scale * I + offset, discarded after training (train_readout affine)
+  decoder (E+D)  =736 x 736 SLM px (set) -> 6624 sim px, one per frame (M = 1), trainable on every pixel (incl. encoding pixels), phase init 0
+<epoch:  0> loss_train:7.352e-04
+<epoch:  0> loss_val:1.693e-06  rmse_mean:1.296e-03  rmse_max:1.708e-03  diff_eff:1.330e-01
+<epoch:  1> loss_train:6.098e-08
+<epoch:  1> loss_val:1.806e-07  rmse_mean:4.197e-04  rmse_max:8.413e-04  diff_eff:1.332e-01
+<epoch:  2> loss_train:7.967e-08
+<epoch:  2> loss_val:5.018e-07  rmse_mean:6.994e-04  rmse_max:1.469e-03  diff_eff:1.332e-01
+<epoch:  3> loss_train:2.513e-07
+<epoch:  3> loss_val:2.218e-06  rmse_mean:1.470e-03  rmse_max:3.353e-03  diff_eff:1.333e-01
+<epoch:  4> loss_train:7.704e-07
+<epoch:  4> loss_val:4.000e-06  rmse_mean:1.945e-03  rmse_max:7.832e-03  diff_eff:1.336e-01
+<epoch:  5> loss_train:1.235e-06
+<epoch:  5> loss_val:4.596e-06  rmse_mean:2.079e-03  rmse_max:6.177e-03  diff_eff:1.346e-01
+<epoch:  6> loss_train:1.062e-06
+<epoch:  6> loss_val:9.301e-06  rmse_mean:3.018e-03  rmse_max:6.567e-03  diff_eff:1.356e-01
+<epoch:  7> loss_train:1.072e-06
+<epoch:  7> loss_val:6.373e-06  rmse_mean:2.427e-03  rmse_max:9.131e-03  diff_eff:1.368e-01
+<epoch:  8> loss_train:1.008e-06
+<epoch:  8> loss_val:2.961e-06  rmse_mean:1.654e-03  rmse_max:7.160e-03  diff_eff:1.378e-01
+<epoch:  9> loss_train:9.891e-07
+<epoch:  9> loss_val:2.603e-05  rmse_mean:4.868e-03  rmse_max:1.233e-02  diff_eff:1.389e-01
+<epoch: 10> loss_train:9.720e-07
+<epoch: 10> loss_val:4.719e-06  rmse_mean:2.017e-03  rmse_max:6.380e-03  diff_eff:1.400e-01
+<epoch: 11> loss_train:9.290e-07
+<epoch: 12> loss_train:9.326e-07
+<epoch: 13> loss_train:8.792e-07
+<epoch: 14> loss_train:8.783e-07
+<epoch: 15> loss_train:8.553e-07
+<epoch: 15> loss_val:4.078e-06  rmse_mean:1.865e-03  rmse_max:6.769e-03  diff_eff:1.452e-01
+<epoch: 16> loss_train:8.346e-07
+<epoch: 17> loss_train:8.297e-07
+<epoch: 18> loss_train:8.085e-07
+<epoch: 19> loss_train:7.801e-07
+<epoch: 20> loss_train:7.839e-07
+<epoch: 20> loss_val:1.985e-06  rmse_mean:1.373e-03  rmse_max:4.643e-03  diff_eff:1.498e-01
+<epoch: 21> loss_train:7.576e-07
+<epoch: 22> loss_train:7.384e-07
+<epoch: 23> loss_train:7.194e-07
+<epoch: 24> loss_train:7.329e-07
+<epoch: 25> loss_train:6.781e-07
+<epoch: 25> loss_val:1.668e-06  rmse_mean:1.257e-03  rmse_max:4.508e-03  diff_eff:1.538e-01
+<epoch: 26> loss_train:6.860e-07
+<epoch: 27> loss_train:6.672e-07
+<epoch: 28> loss_train:6.675e-07
+<epoch: 29> loss_train:6.522e-07
+<epoch: 30> loss_train:6.249e-07
+<epoch: 30> loss_val:1.968e-06  rmse_mean:1.379e-03  rmse_max:2.817e-03  diff_eff:1.571e-01
+<epoch: 31> loss_train:6.270e-07
+<epoch: 32> loss_train:6.043e-07
+<epoch: 33> loss_train:6.112e-07
+<epoch: 34> loss_train:5.741e-07
+<epoch: 35> loss_train:5.663e-07
+<epoch: 35> loss_val:1.319e-06  rmse_mean:1.120e-03  rmse_max:2.861e-03  diff_eff:1.599e-01
+<epoch: 36> loss_train:5.625e-07
+<epoch: 37> loss_train:5.476e-07
+<epoch: 38> loss_train:5.479e-07
+<epoch: 39> loss_train:5.284e-07
+<epoch: 40> loss_train:5.253e-07
+<epoch: 40> loss_val:5.978e-06  rmse_mean:2.395e-03  rmse_max:5.157e-03  diff_eff:1.623e-01
+<epoch: 41> loss_train:5.154e-07
+<epoch: 42> loss_train:5.144e-07
+<epoch: 43> loss_train:5.111e-07
+<epoch: 44> loss_train:4.841e-07
+<epoch: 45> loss_train:4.902e-07
+<epoch: 45> loss_val:4.585e-06  rmse_mean:2.129e-03  rmse_max:3.860e-03  diff_eff:1.642e-01
+<epoch: 46> loss_train:4.840e-07
+<epoch: 47> loss_train:4.683e-07
+<epoch: 48> loss_train:4.744e-07
+<epoch: 49> loss_train:4.584e-07
+<epoch: 50> loss_train:4.528e-07
+<epoch: 50> loss_val:1.420e-06  rmse_mean:1.177e-03  rmse_max:2.415e-03  diff_eff:1.657e-01
+<epoch: 51> loss_train:4.535e-07
+<epoch: 52> loss_train:4.373e-07
+<epoch: 53> loss_train:4.337e-07
+<epoch: 54> loss_train:4.287e-07
+<epoch: 55> loss_train:4.262e-07
+<epoch: 55> loss_val:1.024e-06  rmse_mean:9.926e-04  rmse_max:2.424e-03  diff_eff:1.669e-01
+<epoch: 56> loss_train:4.200e-07
+<epoch: 57> loss_train:4.196e-07
+<epoch: 58> loss_train:4.065e-07
+<epoch: 59> loss_train:4.066e-07
+<epoch: 60> loss_train:4.019e-07
+<epoch: 60> loss_val:1.756e-06  rmse_mean:1.315e-03  rmse_max:2.674e-03  diff_eff:1.678e-01
+<epoch: 61> loss_train:3.955e-07
+<epoch: 62> loss_train:3.928e-07
+<epoch: 63> loss_train:3.860e-07
+<epoch: 64> loss_train:3.842e-07
+<epoch: 65> loss_train:3.803e-07
+<epoch: 65> loss_val:1.800e-06  rmse_mean:1.330e-03  rmse_max:3.813e-03  diff_eff:1.685e-01
+<epoch: 66> loss_train:3.769e-07
+<epoch: 67> loss_train:3.720e-07
+<epoch: 68> loss_train:3.710e-07
+<epoch: 69> loss_train:3.671e-07
+<epoch: 70> loss_train:3.617e-07
+<epoch: 70> loss_val:2.227e-06  rmse_mean:1.484e-03  rmse_max:3.040e-03  diff_eff:1.690e-01
+<epoch: 71> loss_train:3.590e-07
+<epoch: 72> loss_train:3.560e-07
+<epoch: 73> loss_train:3.538e-07
+<epoch: 74> loss_train:3.516e-07
+<epoch: 75> loss_train:3.487e-07
+<epoch: 75> loss_val:2.018e-06  rmse_mean:1.413e-03  rmse_max:2.835e-03  diff_eff:1.693e-01
+<epoch: 76> loss_train:3.467e-07
+<epoch: 77> loss_train:3.440e-07
+<epoch: 78> loss_train:3.416e-07
+<epoch: 79> loss_train:3.407e-07
+<epoch: 80> loss_train:3.373e-07
+<epoch: 80> loss_val:2.054e-06  rmse_mean:1.426e-03  rmse_max:2.846e-03  diff_eff:1.695e-01
+<epoch: 81> loss_train:3.361e-07
+<epoch: 82> loss_train:3.332e-07
+<epoch: 83> loss_train:3.315e-07
+<epoch: 84> loss_train:3.306e-07
+<epoch: 85> loss_train:3.282e-07
+<epoch: 85> loss_val:1.219e-06  rmse_mean:1.092e-03  rmse_max:2.752e-03  diff_eff:1.697e-01
+<epoch: 86> loss_train:3.268e-07
+<epoch: 87> loss_train:3.249e-07
+<epoch: 88> loss_train:3.238e-07
+<epoch: 89> loss_train:3.218e-07
+<epoch: 90> loss_train:3.213e-07
+<epoch: 90> loss_val:1.066e-06  rmse_mean:1.017e-03  rmse_max:2.820e-03  diff_eff:1.697e-01
+<epoch: 91> loss_train:3.203e-07
+<epoch: 92> loss_train:3.184e-07
+<epoch: 93> loss_train:3.166e-07
+<epoch: 94> loss_train:3.162e-07
+<epoch: 95> loss_train:3.154e-07
+<epoch: 95> loss_val:1.442e-06  rmse_mean:1.192e-03  rmse_max:2.874e-03  diff_eff:1.697e-01
+<epoch: 96> loss_train:3.142e-07
+<epoch: 97> loss_train:3.134e-07
+<epoch: 98> loss_train:3.130e-07
+<epoch: 99> loss_train:3.124e-07
+<epoch: 99> loss_val:1.635e-06  rmse_mean:1.271e-03  rmse_max:3.054e-03  diff_eff:1.697e-01

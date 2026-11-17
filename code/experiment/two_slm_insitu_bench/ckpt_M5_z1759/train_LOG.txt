@@ -1,0 +1,27 @@
+Design values ([set] = from --set, [derived] = from formula):
+  device profile = lab: key SLM 8.07 um (16.15 sim px), encoding SLM 4.5 um (9 sim px), sim 0.5 um, camera 5.86 um (12 sim px), N_sim 6720 (3.36 mm), gaps 35.9, 176 mm
+  N_trainable_features = 40960 [derived]  (formula: ceil(r*2*N_alpha*Nf), r=1.25, N_alpha=4, Nf=4096)
+  layer_size     = 0  (K = 0: no diffractive layers, only the phase keys train)
+  phase_key_size = 414 [set]  (formula: detector array / key_det_fill 0.9) -> 6687 sim px
+  detectors      = 64 x 64  (formula: sqrt(Nf)); size 48 px, pitch 96 x 96 px
+  encoding mode  = constant: Np = 4 px per frame, N_alpha = 4 harmonics; displayed alpha = 0 .. 3 (targets centered); background transparent (background_opaque auto)
+  encoding       = 2 x 2 px (rows x cols), 110 SLM px each, gap 0 -> 220 x 220 SLM px = 1980 x 1980 sim px
+  encoding tiles = full -> extent 5940 sim px
+  SLM phase      = 8-bit: 256 levels, step 2pi/256 (straight-through gradient)
+  readout        = val / test: f_hat = (I - Pmin) / (Pmax - Pmin), Pmin / Pmax over all detectors and the a-grid; training loss: learned scale * I + offset, discarded after training (train_readout affine)
+  decoder (E+D)  =736 x 736 SLM px (set) -> 6624 sim px, one per frame (M = 5), trainable on every pixel (incl. encoding pixels), phase init 0
+<epoch:  0> loss_train:9.036e-04
+<epoch:  0> loss_val:1.034e-06  rmse_mean:1.012e-03  rmse_max:2.908e-03  diff_eff:5.776e-02
+<epoch:  1> loss_train:3.280e-08
+<epoch:  1> loss_val:1.232e-07  rmse_mean:3.481e-04  rmse_max:5.406e-04  diff_eff:5.779e-02
+<epoch:  2> loss_train:2.967e-08
+<epoch:  2> loss_val:9.725e-08  rmse_mean:3.085e-04  rmse_max:6.348e-04  diff_eff:5.779e-02
+<epoch:  3> loss_train:3.301e-08
+<epoch:  3> loss_val:1.181e-07  rmse_mean:3.395e-04  rmse_max:6.551e-04  diff_eff:5.780e-02
+<epoch:  4> loss_train:3.727e-08
+<epoch:  4> loss_val:1.597e-07  rmse_mean:3.957e-04  rmse_max:6.949e-04  diff_eff:5.781e-02
+<epoch:  5> loss_train:1.343e-07
+<epoch:  5> loss_val:1.789e-07  rmse_mean:4.188e-04  rmse_max:7.273e-04  diff_eff:5.783e-02
+<epoch:  6> loss_train:1.747e-07
+<epoch:  6> loss_val:1.958e-07  rmse_mean:4.385e-04  rmse_max:7.036e-04  diff_eff:5.786e-02
+stop_epoch 6 reached: stopping (lr schedule of max_epoch 100 kept)
